@@ -9,6 +9,8 @@ import { Toolbar } from "./components/Toolbar";
 import { useEditorStore } from "./store/editorStore";
 import type { Project } from "./types/editor";
 
+const assetUrl = (path: string) => `${import.meta.env.BASE_URL}${path}`;
+
 const propertyShortcuts = {
   p: "position",
   s: "scale",
@@ -157,7 +159,7 @@ export default function App() {
       {showSplash ? (
         <div className="absolute inset-0 z-50 flex items-center justify-center bg-[#06080d]/70 backdrop-blur-md">
           <div className="flex w-full max-w-xl flex-col items-center px-8 text-center">
-            <img className="h-56 w-56 object-contain drop-shadow-2xl md:h-72 md:w-72" src="/assets/bbvep-logo.png" alt="BBVEP" />
+            <img className="h-56 w-56 object-contain drop-shadow-2xl md:h-72 md:w-72" src={assetUrl("assets/bbvep-logo.png")} alt="BBVEP" />
             <div className="mt-8 grid w-full max-w-xs grid-cols-2 gap-3">
               <button className="h-10 border border-editor-cyan bg-cyan-950/45 text-[13px] font-semibold text-editor-cyan shadow-xl shadow-cyan-950/20 hover:bg-cyan-900/50" style={{ borderRadius: 6 }} onClick={startNewProject}>
                 New
