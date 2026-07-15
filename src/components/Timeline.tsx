@@ -64,7 +64,11 @@ function finiteNumber(value: unknown, fallback: number) {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
-export function Timeline() {
+type TimelineProps = {
+  mobile?: boolean;
+};
+
+export function Timeline({ mobile = false }: TimelineProps) {
   const [expandedLayerIds, setExpandedLayerIds] = useState<string[]>([]);
   const [dragging, setDragging] = useState<Dragging | null>(null);
   const timelineScrollRef = useRef<HTMLDivElement | null>(null);
@@ -133,7 +137,8 @@ export function Timeline() {
   const timelineWidth = durationFrames * frameWidth;
   const timelineCanvasWidth = Math.max(timelineWidth, 900);
   const timelineHeight = rows.length * rowHeight + rulerHeight;
-  const timelineGridWidth = labelWidth + timelineCanvasWidth;
+  const currentLabelWidth = mobile ? 168 : labelWidth;
+  const timelineGridWidth = currentLabelWidth + timelineCanvasWidth;
   const canSplitLayer = selectedLayerIds.some((layerId) => {
     const layer = composition.layers.find((candidate) => candidate.id === layerId);
     return Boolean(layer && !layer.locked && playheadFrame > layer.startFrame && playheadFrame < layer.endFrame);
@@ -141,7 +146,7 @@ export function Timeline() {
 
   const fitTimeline = () => {
     const scroller = timelineScrollRef.current;
-    const availableWidth = Math.max(240, (scroller?.clientWidth ?? 900) - labelWidth);
+    const availableWidth = Math.max(240, (scroller?.clientWidth ?? 900) - currentLabelWidth);
     setTimelineZoom(availableWidth / durationFrames);
     if (scroller) scroller.scrollLeft = 0;
   };
@@ -149,7 +154,7 @@ export function Timeline() {
   const centerPlayhead = () => {
     const scroller = timelineScrollRef.current;
     if (!scroller) return;
-    const playheadX = labelWidth + playheadFrame * frameWidth;
+    const playheadX = currentLabelWidth + playheadFrame * frameWidth;
     scroller.scrollLeft = Math.max(0, playheadX - scroller.clientWidth / 2);
   };
 
@@ -172,23 +177,23 @@ export function Timeline() {
   };
 
   return (
-    <section className="flex h-56 min-h-0 min-w-0 flex-col overflow-hidden border-t panel-divider bg-editor-shell">
-      <div className="flex h-10 shrink-0 items-center justify-between border-b panel-divider px-3">
-        <div className="flex items-center gap-2">
+    <section className={`flex ${mobile ? "h-full" : "h-56"} min-h-0 min-w-0 flex-col overflow-hidden border-t panel-divider bg-editor-shell`}>
+      <div className="flex h-10 shrink-0 items-center justify-between gap-3 overflow-x-auto border-b panel-divider px-3">
+        <div className="flex shrink-0 items-center gap-2">
           <span className="text-[12px] font-semibold uppercase text-editor-muted">Timeline</span>
           <button className="icon-button h-7 w-7" title="Copy keyframes" onClick={copySelection}><Copy size={13} /></button>
           <button className="icon-button h-7 w-7" title="Split selected layer at playhead" disabled={!canSplitLayer} onClick={splitSelectedLayers}><Scissors size={13} /></button>
           <button className="icon-button h-7 w-7" title="Delete selection" onClick={deleteSelection}><Trash2 size={13} /></button>
           <button className={`icon-button h-7 w-7 ${graphMode === "speed" ? "icon-button-active" : ""}`} title="Speed graph" onClick={() => setGraphMode(graphMode === "speed" ? "value" : "speed")}><Gauge size={13} /></button>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex shrink-0 items-center gap-2">
           <button className="icon-button h-7 w-7" title="Fit timeline" onClick={fitTimeline}><Maximize2 size={13} /></button>
           <button className="icon-button h-7 w-7" title="Center playhead" onClick={centerPlayhead}><LocateFixed size={13} /></button>
           <label className="flex items-center gap-2 text-[12px] text-editor-muted">Zoom<input className="w-28 accent-editor-cyan" type="range" min={1} max={18} value={frameWidth} onChange={(event) => setTimelineZoom(Number(event.currentTarget.value))} /></label>
         </div>
       </div>
       <div ref={timelineScrollRef} className="min-h-0 min-w-0 flex-1 overflow-auto">
-        <div className="grid min-h-full" style={{ width: timelineGridWidth, gridTemplateColumns: `${labelWidth}px ${timelineCanvasWidth}px` }}>
+        <div className="grid min-h-full" style={{ width: timelineGridWidth, gridTemplateColumns: `${currentLabelWidth}px ${timelineCanvasWidth}px` }}>
           <div className="sticky left-0 z-10 border-r panel-divider bg-editor-shell">
             <div className="sticky top-0 z-10 h-[30px] border-b panel-divider bg-editor-shell px-3 py-2 text-[11px] uppercase text-editor-muted">Layer</div>
             <div>

@@ -142,6 +142,7 @@ function maskTupleValue(mask: Mask, property: "position" | "scale", frame: numbe
 
 type PropertyInspectorProps = {
   collapsed?: boolean;
+  mobile?: boolean;
   onToggleCollapsed?: () => void;
 };
 
@@ -172,7 +173,7 @@ function InspectorHeader({ title, onToggleCollapsed }: { title: string; onToggle
   );
 }
 
-export function PropertyInspector({ collapsed = false, onToggleCollapsed }: PropertyInspectorProps) {
+export function PropertyInspector({ collapsed = false, mobile = false, onToggleCollapsed }: PropertyInspectorProps) {
   const selectedMaskRowRef = useRef<HTMLDivElement | null>(null);
   const transformSectionRef = useRef<HTMLElement | null>(null);
   const [scaleLinkedByLayer, setScaleLinkedByLayer] = useState<Record<string, boolean>>({});
@@ -244,14 +245,19 @@ export function PropertyInspector({ collapsed = false, onToggleCollapsed }: Prop
     transformSectionRef.current?.scrollIntoView({ block: "nearest" });
   }, [layer?.id, selectedProperty, selectedMaskId]);
 
-  if (collapsed) {
+  const inspectorShellClass = mobile
+    ? "flex h-full min-h-0 w-full flex-col overflow-hidden border-t panel-divider bg-editor-panel"
+    : "flex min-h-0 w-[360px] shrink-0 flex-col overflow-hidden border-l panel-divider bg-editor-panel";
+  const headerToggle = mobile ? undefined : onToggleCollapsed;
+
+  if (collapsed && !mobile) {
     return <InspectorRail onToggleCollapsed={onToggleCollapsed} />;
   }
 
   if (!layer) {
     return (
-      <aside className="flex min-h-0 w-[360px] shrink-0 flex-col overflow-hidden border-l panel-divider bg-editor-panel">
-        <InspectorHeader title="No layer selected" onToggleCollapsed={onToggleCollapsed} />
+      <aside className={inspectorShellClass}>
+        <InspectorHeader title="No layer selected" onToggleCollapsed={headerToggle} />
         <div className="p-4 text-[13px] text-editor-muted">No layer selected</div>
       </aside>
     );
@@ -432,8 +438,8 @@ export function PropertyInspector({ collapsed = false, onToggleCollapsed }: Prop
     );
   };
   return (
-    <aside className="flex min-h-0 w-[360px] shrink-0 flex-col overflow-hidden border-l panel-divider bg-editor-panel">
-      <InspectorHeader title={layer.name} onToggleCollapsed={onToggleCollapsed} />
+    <aside className={inspectorShellClass}>
+      <InspectorHeader title={layer.name} onToggleCollapsed={headerToggle} />
       <div className="min-h-0 flex-1 overflow-y-auto">
         <section ref={transformSectionRef} className="border-b panel-divider">
           <div className="flex h-10 items-center gap-2 px-4 text-[13px] font-semibold text-editor-ink">

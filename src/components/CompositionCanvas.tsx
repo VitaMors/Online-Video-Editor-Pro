@@ -1569,7 +1569,7 @@ export function CompositionCanvas() {
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || !composition) return;
-    if (compositionIsOffscreen(canvas, composition, canvasZoom, canvasPan)) {
+    if ((canvasPan[0] !== 0 || canvasPan[1] !== 0) && compositionIsOffscreen(canvas, composition, canvasZoom, canvasPan)) {
       setCanvasPan([0, 0]);
     }
   }, [canvasPan, canvasVersion, canvasZoom, composition, setCanvasPan]);

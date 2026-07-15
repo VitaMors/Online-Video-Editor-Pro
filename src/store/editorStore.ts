@@ -544,7 +544,11 @@ export const useEditorStore = create<EditorState>()(
       togglePlayback: () => set((state) => ({ isPlaying: !state.isPlaying })),
       setPlayback: (isPlaying) => set({ isPlaying }),
       setCanvasZoom: (zoom) => set({ canvasZoom: Math.min(3, Math.max(0.1, zoom)) }),
-      setCanvasPan: (canvasPan) => set({ canvasPan }),
+      setCanvasPan: (canvasPan) => set((state) => {
+        const nextPan: [number, number] = [finiteNumber(canvasPan[0], 0), finiteNumber(canvasPan[1], 0)];
+        if (state.canvasPan[0] === nextPan[0] && state.canvasPan[1] === nextPan[1]) return state;
+        return { canvasPan: nextPan };
+      }),
       toggleGrid: () => set((state) => ({ showGrid: !state.showGrid })),
       toggleGuides: () => set((state) => ({ showGuides: !state.showGuides })),
       setTimelineZoom: (timelineZoom) => set({ timelineZoom: Math.min(18, Math.max(1, finiteNumber(timelineZoom, 4))) }),

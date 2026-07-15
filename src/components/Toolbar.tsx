@@ -41,8 +41,8 @@ export function Toolbar() {
   const seconds = composition ? playheadFrame / Math.max(1, fps) : 0;
 
   return (
-    <header className="flex h-12 items-center justify-between border-b panel-divider bg-editor-shell px-3">
-      <div className="flex min-w-0 items-center gap-2">
+    <header className="flex h-12 items-center justify-between gap-3 overflow-x-auto border-b panel-divider bg-editor-shell px-3">
+      <div className="flex shrink-0 items-center gap-2">
         <button className="icon-button" title="Play or pause" onClick={togglePlayback}>
           {isPlaying ? <Pause size={16} /> : <Play size={16} />}
         </button>
@@ -58,7 +58,7 @@ export function Toolbar() {
         </div>
       </div>
 
-      <div className="flex items-center gap-2">
+      <div className="flex shrink-0 items-center gap-2">
         <input
           ref={fileInputRef}
           className="hidden"

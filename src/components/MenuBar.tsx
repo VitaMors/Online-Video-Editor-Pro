@@ -397,7 +397,7 @@ export function MenuBar() {
 
   return (
     <>
-      <nav className="relative z-30 flex h-8 shrink-0 items-center border-b border-[#2e2e2e] bg-[#444] px-3 text-[13px] text-[#e7e7e7]">
+      <nav className="relative z-30 flex h-8 shrink-0 items-center overflow-x-auto border-b border-[#2e2e2e] bg-[#444] px-3 text-[13px] text-[#e7e7e7]">
         <input
           ref={imageInputRef}
           className="hidden"

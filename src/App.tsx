@@ -18,6 +18,9 @@ const propertyShortcuts = {
   t: "opacity",
 } as const;
 
+type EditorLayoutMode = "desktop" | "iphone";
+type IPhonePanel = "layers" | "timeline" | "inspector";
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -42,6 +45,8 @@ export default function App() {
   const playheadFrameRef = useRef(0);
   const splashProjectInputRef = useRef<HTMLInputElement | null>(null);
   const [showSplash, setShowSplash] = useState(true);
+  const [layoutMode, setLayoutMode] = useState<EditorLayoutMode>("desktop");
+  const [iphonePanel, setIphonePanel] = useState<IPhonePanel>("timeline");
   const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
   const [graphCollapsed, setGraphCollapsed] = useState(false);
   const isPlaying = useEditorStore((state) => state.isPlaying);
@@ -61,6 +66,7 @@ export default function App() {
   const previousKeyframe = useEditorStore((state) => state.previousKeyframe);
   const nextKeyframe = useEditorStore((state) => state.nextKeyframe);
   const selectProperty = useEditorStore((state) => state.selectProperty);
+  const iphoneMode = layoutMode === "iphone";
 
   useEffect(() => {
     playheadFrameRef.current = playheadFrame;
@@ -121,6 +127,14 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [copySelection, deleteSelection, nextKeyframe, pasteKeyframes, playheadFrame, previousKeyframe, redo, selectProperty, setPlayback, setPlayheadFrame, showSplash, splitSelectedLayers, togglePlayback, undo]);
 
+
+  const chooseLayoutMode = (mode: EditorLayoutMode) => {
+    setLayoutMode(mode);
+    if (mode === "iphone") {
+      setIphonePanel("timeline");
+      setInspectorCollapsed(false);
+    }
+  };
   const openSplashProject = async (file: File) => {
     try {
       const payload = JSON.parse(await file.text()) as unknown;
@@ -151,24 +165,56 @@ export default function App() {
           event.currentTarget.value = "";
         }}
       />
-      <div className={`grid h-full min-h-0 min-w-0 overflow-hidden grid-rows-[32px_48px_minmax(0,1fr)] bg-editor-shell transition duration-500 ${showSplash ? "pointer-events-none select-none scale-[1.01] blur-sm" : "blur-0"}`}>
+      <div className={`grid h-full min-h-0 min-w-0 overflow-hidden grid-rows-[32px_48px_minmax(0,1fr)] bg-editor-shell transition duration-500 ${showSplash ? "pointer-events-none select-none blur-sm" : "blur-0"}`}>
         <MenuBar />
         <Toolbar />
-        <main className="grid min-h-0 min-w-0 overflow-hidden" style={{ gridTemplateColumns: inspectorCollapsed ? "288px minmax(0, 1fr) 44px" : "288px minmax(0, 1fr) 360px" }}>
-          <LayerPanel />
-          <div className="grid min-h-0 min-w-0 overflow-hidden grid-rows-[minmax(0,1fr)_auto_auto]">
+        {iphoneMode ? (
+          <main className="grid min-h-0 min-w-0 overflow-hidden grid-rows-[minmax(220px,1fr)_auto_44px_minmax(220px,42vh)]">
             <CompositionCanvas />
             <GraphEditor collapsed={graphCollapsed} onToggleCollapsed={() => setGraphCollapsed((current) => !current)} />
-            <Timeline />
-          </div>
-          <PropertyInspector collapsed={inspectorCollapsed} onToggleCollapsed={() => setInspectorCollapsed((current) => !current)} />
-        </main>
+            <div className="grid grid-cols-3 border-y panel-divider bg-editor-panel2 px-2 py-1">
+              {(["layers", "timeline", "inspector"] as IPhonePanel[]).map((panel) => (
+                <button
+                  key={panel}
+                  className={`h-8 border text-[12px] font-semibold capitalize ${iphonePanel === panel ? "border-editor-cyan bg-cyan-950/40 text-editor-cyan" : "border-transparent text-editor-muted"}`}
+                  style={{ borderRadius: 6 }}
+                  onClick={() => setIphonePanel(panel)}
+                >
+                  {panel}
+                </button>
+              ))}
+            </div>
+            <section className="min-h-0 min-w-0 overflow-hidden bg-editor-shell">
+              {iphonePanel === "layers" ? <LayerPanel mobile /> : null}
+              {iphonePanel === "timeline" ? <Timeline mobile /> : null}
+              {iphonePanel === "inspector" ? <PropertyInspector mobile /> : null}
+            </section>
+          </main>
+        ) : (
+          <main className="grid min-h-0 min-w-0 overflow-hidden" style={{ gridTemplateColumns: inspectorCollapsed ? "288px minmax(0, 1fr) 44px" : "288px minmax(0, 1fr) 360px" }}>
+            <LayerPanel />
+            <div className="grid min-h-0 min-w-0 overflow-hidden grid-rows-[minmax(0,1fr)_auto_auto]">
+              <CompositionCanvas />
+              <GraphEditor collapsed={graphCollapsed} onToggleCollapsed={() => setGraphCollapsed((current) => !current)} />
+              <Timeline />
+            </div>
+            <PropertyInspector collapsed={inspectorCollapsed} onToggleCollapsed={() => setInspectorCollapsed((current) => !current)} />
+          </main>
+        )}
       </div>
       {showSplash ? (
         <div className="absolute inset-0 z-50 flex items-center justify-center bg-[#06080d]/70 backdrop-blur-md">
           <div className="flex w-full max-w-xl flex-col items-center px-8 text-center">
             <img className="h-56 w-56 object-contain drop-shadow-2xl md:h-72 md:w-72" src={assetUrl("assets/bbvep-logo.png")} alt="BBVEP" />
-            <div className="mt-8 grid w-full max-w-xs grid-cols-2 gap-3">
+            <div className="mt-7 grid w-full max-w-xs grid-cols-2 gap-2 border border-editor-line bg-editor-panel/80 p-1 shadow-xl shadow-black/20" style={{ borderRadius: 7 }}>
+              <button className={`h-9 text-[12px] font-semibold ${!iphoneMode ? "bg-cyan-950/45 text-editor-cyan" : "text-editor-muted hover:text-editor-ink"}`} style={{ borderRadius: 5 }} onClick={() => chooseLayoutMode("desktop")}>
+                Desktop
+              </button>
+              <button className={`h-9 text-[12px] font-semibold ${iphoneMode ? "bg-cyan-950/45 text-editor-cyan" : "text-editor-muted hover:text-editor-ink"}`} style={{ borderRadius: 5 }} onClick={() => chooseLayoutMode("iphone")}>
+                iPhone Mode
+              </button>
+            </div>
+            <div className="mt-4 grid w-full max-w-xs grid-cols-2 gap-3">
               <button className="h-10 border border-editor-cyan bg-cyan-950/45 text-[13px] font-semibold text-editor-cyan shadow-xl shadow-cyan-950/20 hover:bg-cyan-900/50" style={{ borderRadius: 6 }} onClick={startNewProject}>
                 New
               </button>

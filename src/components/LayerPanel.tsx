@@ -25,7 +25,11 @@ function placementFromDrag(event: DragEvent<HTMLDivElement>): DropTarget["placem
   return event.clientY < rect.top + rect.height / 2 ? "above" : "below";
 }
 
-export function LayerPanel() {
+type LayerPanelProps = {
+  mobile?: boolean;
+};
+
+export function LayerPanel({ mobile = false }: LayerPanelProps) {
   const [dragLayerId, setDragLayerId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<DropTarget | null>(null);
   const composition = useEditorStore((state) =>
@@ -41,7 +45,7 @@ export function LayerPanel() {
   if (!composition) return null;
 
   return (
-    <aside className="flex min-h-0 w-72 flex-col border-r panel-divider bg-editor-panel">
+    <aside className={`flex min-h-0 ${mobile ? "h-full w-full border-t" : "w-72 border-r"} flex-col panel-divider bg-editor-panel`}>
       <div className="flex h-10 items-center justify-between border-b panel-divider px-3">
         <span className="text-[12px] font-semibold uppercase text-editor-muted">Layers</span>
         <span className="font-mono text-[11px] text-editor-muted">{composition.layers.length}</span>
@@ -56,7 +60,7 @@ export function LayerPanel() {
           return (
             <div
               key={layer.id}
-              className={`grid grid-cols-[20px_26px_26px_26px_26px_minmax(0,1fr)] items-center gap-1 px-2 py-2 transition ${droppingAbove ? "border-t-2 border-t-editor-cyan" : ""} ${droppingBelow ? "border-b-2 border-b-editor-cyan" : "border-b border-editor-line/70"} ${activeDrag ? "opacity-55" : selected ? "bg-cyan-950/35" : "hover:bg-editor-panel2"}`}
+              className={`grid grid-cols-[20px_28px_28px_28px_28px_minmax(0,1fr)] items-center gap-1 px-2 py-2 transition ${droppingAbove ? "border-t-2 border-t-editor-cyan" : ""} ${droppingBelow ? "border-b-2 border-b-editor-cyan" : "border-b border-editor-line/70"} ${activeDrag ? "opacity-55" : selected ? "bg-cyan-950/35" : "hover:bg-editor-panel2"}`}
               onClick={() => selectLayer(layer.id)}
               onDragOver={(event) => {
                 if (!dragLayerId || dragLayerId === layer.id) return;
