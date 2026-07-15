@@ -3,16 +3,17 @@ import { Fragment, useEffect, useRef, useState } from "react";
 import { evaluatePathProperty, evaluateProperty, propertyLabel } from "../lib/animation";
 import { effectControlDefinition, effectDefinition, effectNumberValue, effectStaticValue, isEffectNumberControl } from "../lib/effects";
 import { useEditorStore } from "../store/editorStore";
-import type { AnimatableProperty, AnimatableValue, EasePreset, Effect, EffectPropertyKey, Keyframe, Mask, MaskPropertyKey, TransformPropertyKey } from "../types/editor";
+import type { AnimatableProperty, AnimatableValue, EasePreset, Effect, EffectPropertyKey, Keyframe, Mask, MaskPropertyKey, SpatialVector, TransformPropertyKey } from "../types/editor";
 
 const rows: TransformPropertyKey[] = ["position", "scale", "rotation", "opacity", "anchorPoint"];
+const modelRows: TransformPropertyKey[] = ["position", "scale", "rotationX", "rotationY", "rotation", "opacity", "anchorPoint"];
 
 function isTuple(value: AnimatableValue): value is [number, number] {
   return Array.isArray(value);
 }
 
 function scrubStep(property: TransformPropertyKey | MaskPropertyKey) {
-  if (property === "rotation") return 0.25;
+  if (property === "rotation" || property === "rotationX" || property === "rotationY") return 0.25;
   if (property === "scale" || property === "opacity" || property === "feather") return 0.5;
   return 1;
 }
@@ -446,20 +447,40 @@ export function PropertyInspector({ collapsed = false, mobile = false, onToggleC
             <ChevronDown size={15} /> Transform
           </div>
           <div className="pb-3">
-            {rows.map((property) => {
+            {(layer.type === "model" ? modelRows : rows).map((property) => {
               const propertyState = layer.transform[property];
+              if (!propertyState) return null;
               const value = evaluateProperty(propertyState as AnimatableProperty<AnimatableValue>, playheadFrame);
               const active = selectedProperty === property && !selectedMaskId && !selectedSourceProperty && !selectedEffectId;
               const step = scrubStep(property);
+              const vectorLength = isTuple(value) ? value.length : 0;
+              const vectorGridClass = property === "scale"
+                ? vectorLength >= 3
+                  ? "grid-cols-[minmax(0,1fr)_22px_minmax(0,1fr)_minmax(0,1fr)]"
+                  : "grid-cols-[minmax(0,1fr)_22px_minmax(0,1fr)]"
+                : vectorLength >= 3
+                  ? "grid-cols-3"
+                  : "grid-cols-2";
+              const updateVectorComponent = (component: number, next: number) => {
+                if (!isTuple(value)) return;
+                const nextValue = [...value] as number[];
+                if (property === "scale" && scaleLinked) {
+                  nextValue.fill(next);
+                } else {
+                  nextValue[component] = next;
+                }
+                updateTransformValue(layer.id, property, nextValue as never);
+              };
+
               return (
                 <div key={property} className={`grid grid-cols-[78px_minmax(96px,1fr)_auto] items-center gap-2 px-4 py-1.5 ${active ? "bg-editor-panel2" : ""}`} onClick={() => selectProperty(property)}>
                   <button className="flex min-w-0 items-center gap-2 text-left text-[12px] text-editor-muted" onClick={() => selectProperty(property)}>
                     <span className="truncate">{propertyLabel(property)}</span>
                   </button>
-                  <div className={`grid min-w-0 ${property === "scale" ? "grid-cols-[minmax(0,1fr)_22px_minmax(0,1fr)]" : "grid-cols-2"} gap-1`}>
+                  <div className={`grid min-w-0 ${vectorGridClass} gap-1`}>
                     {isTuple(value) ? (
                       <>
-                        <DragNumberField value={value[0]} step={step} onChange={(next) => updateTransformValue(layer.id, property, property === "scale" && scaleLinked ? [next, next] as never : [next, value[1]] as never)} />
+                        <DragNumberField value={value[0]} step={step} onChange={(next) => updateVectorComponent(0, next)} />
                         {property === "scale" ? (
                           <button
                             type="button"
@@ -474,10 +495,11 @@ export function PropertyInspector({ collapsed = false, mobile = false, onToggleC
                             {scaleLinked ? <Link2 size={11} /> : <Link2Off size={11} />}
                           </button>
                         ) : null}
-                        <DragNumberField value={value[1]} step={step} onChange={(next) => updateTransformValue(layer.id, property, property === "scale" && scaleLinked ? [next, next] as never : [value[0], next] as never)} />
+                        <DragNumberField value={value[1]} step={step} onChange={(next) => updateVectorComponent(1, next)} />
+                        {vectorLength >= 3 ? <DragNumberField value={(value as unknown as [number, number, number])[2] ?? 0} step={step} onChange={(next) => updateVectorComponent(2, next)} /> : null}
                       </>
                     ) : (
-                      <DragNumberField className="col-span-2" value={value} step={step} onChange={(next) => updateTransformValue(layer.id, property, next as never)} />
+                      <DragNumberField className="col-span-2" value={value as number} step={step} onChange={(next) => updateTransformValue(layer.id, property, next as never)} />
                     )}
                   </div>
                   <div className="flex justify-end gap-1">

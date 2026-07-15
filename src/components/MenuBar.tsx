@@ -402,7 +402,7 @@ export function MenuBar() {
           ref={imageInputRef}
           className="hidden"
           type="file"
-          accept="image/*,video/mp4,video/*,audio/mpeg,audio/wav,audio/*,.mp3,.wav"
+          accept="image/*,video/mp4,video/*,audio/mpeg,audio/wav,audio/*,model/gltf-binary,model/gltf+json,.mp3,.wav,.glb,.gltf"
           onChange={(event) => {
             const file = event.target.files?.[0];
             if (file) importImage(file);

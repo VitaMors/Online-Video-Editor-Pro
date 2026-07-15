@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import * as THREE from "three";
+import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { evaluatePathProperty, evaluateProperty, getLayerSize, getWorldPosition } from "../lib/animation";
 import { applyColorGradingShader } from "../lib/colorGradingShader";
 import { effectNumberValue, effectStaticValue } from "../lib/effects";
 import { useEditorStore } from "../store/editorStore";
-import type { Composition, Effect, Layer, Mask, MaskPath, Vector2 } from "../types/editor";
+import type { Composition, Effect, Layer, Mask, MaskPath, SpatialVector, Vector2 } from "../types/editor";
 
 type DragState =
-  | { type: "layer"; layerId: string; startPoint: Vector2; startPosition: Vector2 }
+  | { type: "layer"; layerId: string; startPoint: Vector2; startPosition: SpatialVector }
   | { type: "maskVertex"; layerId: string; maskId: string; pointIndex: number; startPath: MaskPath; startPointer: Vector2; startScale: Vector2 }
   | { type: "pan"; startScreen: Vector2; startPan: Vector2 };
 
@@ -27,9 +29,24 @@ type CachedVideoFrame = {
   height: number;
 };
 
+type CachedModel = {
+  status: "loading" | "ready" | "error";
+  scene?: THREE.Object3D;
+  error?: unknown;
+  promise?: Promise<void>;
+};
+
+type ModelRenderRuntime = {
+  canvas: HTMLCanvasElement;
+  renderer: THREE.WebGLRenderer;
+  scene: THREE.Scene;
+  camera: THREE.PerspectiveCamera;
+};
 const EXPORT_VIDEO_EVENT = "bbvep:export-composition-video";
 const EXPORT_VIDEO_STATUS_EVENT = "bbvep:export-composition-video-status";
 const videoFrameCache = new Map<string, CachedVideoFrame>();
+const modelCache = new Map<string, CachedModel>();
+const modelRenderCache = new Map<string, ModelRenderRuntime>();
 
 function shouldDrawLayer(layer: Layer, frame: number, soloActive: boolean) {
   if (layer.visible === false || layer.type === "null" || layer.type === "audio") return false;
@@ -225,7 +242,140 @@ function drawMediaPlaceholder(context: CanvasRenderingContext2D, width: number, 
     context.fillText(label, width / 2, height / 2);
   }
 }
+function drawModelPlaceholder(context: CanvasRenderingContext2D, width: number, height: number, label: string) {
+  context.save();
+  context.fillStyle = "#141b26";
+  context.fillRect(0, 0, width, height);
+  context.strokeStyle = "#39d0c8";
+  context.lineWidth = 3;
+  context.strokeRect(0, 0, width, height);
 
+  const size = Math.min(width, height) * 0.42;
+  const cx = width / 2;
+  const cy = height / 2 - size * 0.08;
+  const offset = size * 0.28;
+  const left = cx - size / 2;
+  const top = cy - size / 2;
+  const right = cx + size / 2;
+  const bottom = cy + size / 2;
+  context.strokeStyle = "rgba(57, 208, 200, 0.9)";
+  context.lineWidth = Math.max(2, size * 0.018);
+  context.beginPath();
+  context.rect(left, top, size, size);
+  context.rect(left + offset, top - offset, size, size);
+  context.moveTo(left, top);
+  context.lineTo(left + offset, top - offset);
+  context.moveTo(right, top);
+  context.lineTo(right + offset, top - offset);
+  context.moveTo(left, bottom);
+  context.lineTo(left + offset, bottom - offset);
+  context.moveTo(right, bottom);
+  context.lineTo(right + offset, bottom - offset);
+  context.stroke();
+
+  context.fillStyle = "#e6edf3";
+  context.font = `700 ${Math.max(18, Math.round(size * 0.12))}px Inter, system-ui, sans-serif`;
+  context.textAlign = "center";
+  context.textBaseline = "middle";
+  context.fillText(label, width / 2, height - Math.max(36, height * 0.16));
+  context.restore();
+}
+
+function modelRenderKey(modelUrl: string, width: number, height: number) {
+  return `${modelUrl}::${Math.max(1, Math.round(width))}x${Math.max(1, Math.round(height))}`;
+}
+
+function modelRuntime(modelUrl: string, width: number, height: number) {
+  const pixelWidth = Math.max(1, Math.round(width));
+  const pixelHeight = Math.max(1, Math.round(height));
+  const key = modelRenderKey(modelUrl, pixelWidth, pixelHeight);
+  const cached = modelRenderCache.get(key);
+  if (cached) return cached;
+
+  try {
+    const canvas = document.createElement("canvas");
+    canvas.width = pixelWidth;
+    canvas.height = pixelHeight;
+    const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true, preserveDrawingBuffer: true });
+    renderer.setPixelRatio(1);
+    renderer.setSize(pixelWidth, pixelHeight, false);
+    renderer.setClearColor(0x000000, 0);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(35, pixelWidth / pixelHeight, 0.01, 1000);
+    const runtime = { canvas, renderer, scene, camera };
+    modelRenderCache.set(key, runtime);
+    return runtime;
+  } catch {
+    return undefined;
+  }
+}
+
+function clearThreeScene(scene: THREE.Scene) {
+  while (scene.children.length > 0) scene.remove(scene.children[0]);
+}
+
+function numericVectorComponent(value: unknown, index: number, fallback: number) {
+  return Array.isArray(value) && typeof value[index] === "number" && Number.isFinite(value[index]) ? value[index] : fallback;
+}
+
+function drawModelScene(
+  context: CanvasRenderingContext2D,
+  layer: Layer,
+  modelScene: THREE.Object3D,
+  modelUrl: string,
+  frame: number,
+  width: number,
+  height: number,
+) {
+  const runtime = modelRuntime(modelUrl, width, height);
+  if (!runtime) return false;
+
+  const clonedModel = modelScene.clone(true);
+  const bounds = new THREE.Box3().setFromObject(clonedModel);
+  if (bounds.isEmpty()) return false;
+
+  const size = bounds.getSize(new THREE.Vector3());
+  const center = bounds.getCenter(new THREE.Vector3());
+  const largestAxis = Math.max(size.x, size.y, size.z, 0.001);
+  clonedModel.position.sub(center);
+
+  const scale = evaluateProperty(layer.transform.scale, frame);
+  const position = evaluateProperty(layer.transform.position, frame);
+  const rotationX = evaluateProperty(layer.transform.rotationX, frame);
+  const rotationY = evaluateProperty(layer.transform.rotationY, frame);
+  const zScale = Math.max(0.001, numericVectorComponent(scale, 2, 100) / 100);
+  const zPosition = numericVectorComponent(position, 2, 0);
+
+  const group = new THREE.Group();
+  group.add(clonedModel);
+  const normalizedScale = 2.35 / largestAxis;
+  group.scale.set(normalizedScale, normalizedScale, normalizedScale * zScale);
+  group.rotation.x = (finiteNumber(rotationX, 0) * Math.PI) / 180;
+  group.rotation.y = (finiteNumber(rotationY, 0) * Math.PI) / 180;
+
+  clearThreeScene(runtime.scene);
+  runtime.scene.add(new THREE.AmbientLight(0xffffff, 1.8));
+  const keyLight = new THREE.DirectionalLight(0xffffff, 2.4);
+  keyLight.position.set(3, 4, 5);
+  runtime.scene.add(keyLight);
+  const rimLight = new THREE.DirectionalLight(0x39d0c8, 0.8);
+  rimLight.position.set(-4, 2, 3);
+  runtime.scene.add(rimLight);
+  runtime.scene.add(group);
+
+  const cameraDistance = Math.max(1.35, Math.min(14, 4.4 - zPosition / 260));
+  runtime.camera.aspect = Math.max(1, Math.round(width)) / Math.max(1, Math.round(height));
+  runtime.camera.position.set(0, 0, cameraDistance);
+  runtime.camera.lookAt(0, 0, 0);
+  runtime.camera.updateProjectionMatrix();
+
+  runtime.renderer.clear(true, true, true);
+  runtime.renderer.render(runtime.scene, runtime.camera);
+  context.drawImage(runtime.canvas, 0, 0, width, height);
+  return true;
+}
 function mediaTimeForFrame(layer: Layer, frame: number, fps: number, duration = 0) {
   const timeRemap = layer.type === "video" ? layer.source?.timeRemap : undefined;
   if (timeRemap) {
@@ -361,6 +511,15 @@ function drawLayerContent(
     } else {
       drawMediaPlaceholder(context, width, height, "Loading Image");
     }
+  }
+
+  if (layer.type === "model" && source?.modelUrl) {
+    const cachedModel = modelCache.get(source.modelUrl);
+    const label = source.fileName ? `3D Model: ${source.fileName}` : "3D Model";
+    if (cachedModel?.status === "ready" && cachedModel.scene && drawModelScene(context, layer, cachedModel.scene, source.modelUrl, frame, width, height)) {
+      return;
+    }
+    drawModelPlaceholder(context, width, height, cachedModel?.status === "error" ? "Could not load 3D Model" : cachedModel?.status === "loading" ? "Loading 3D Model" : label);
   }
 
   if (layer.type === "video" && source?.videoUrl) {
@@ -1176,6 +1335,10 @@ async function seekVideoForExport(video: HTMLVideoElement, time: number, toleran
   });
 }
 
+function waitForModelForExport(modelUrl: string) {
+  const cachedModel = modelCache.get(modelUrl);
+  return cachedModel?.promise ?? Promise.resolve();
+}
 async function waitForExportAssets(
   composition: Composition,
   images: Map<string, HTMLImageElement>,
@@ -1189,7 +1352,11 @@ async function waitForExportAssets(
     .map((layer) => layer.source?.videoUrl ? videos.get(layer.source.videoUrl) : undefined)
     .filter((video): video is HTMLVideoElement => Boolean(video))
     .map(waitForMediaMetadataForExport);
-  await Promise.all([...imageTasks, ...videoTasks]);
+  const modelTasks = composition.layers
+    .map((layer) => layer.source?.modelUrl)
+    .filter((modelUrl): modelUrl is string => Boolean(modelUrl))
+    .map(waitForModelForExport);
+  await Promise.all([...imageTasks, ...videoTasks, ...modelTasks]);
 }
 
 async function prepareVideosForExportFrame(
@@ -1472,6 +1639,32 @@ export function CompositionCanvas() {
         audio.load();
         audioCache.current.set(audioUrl, audio);
       }
+
+      const modelUrl = layer.source?.modelUrl;
+      if (modelUrl && !modelCache.has(modelUrl)) {
+        const cachedModel: CachedModel = { status: "loading" };
+        const loader = new GLTFLoader();
+        loader.setCrossOrigin("anonymous");
+        cachedModel.promise = new Promise((resolve) => {
+          loader.load(
+            modelUrl,
+            (gltf) => {
+              cachedModel.status = "ready";
+              cachedModel.scene = gltf.scene;
+              setMediaVersion((version) => version + 1);
+              resolve();
+            },
+            undefined,
+            (error) => {
+              cachedModel.status = "error";
+              cachedModel.error = error;
+              setMediaVersion((version) => version + 1);
+              resolve();
+            },
+          );
+        });
+        modelCache.set(modelUrl, cachedModel);
+      }
     });
   }, [composition, updateMediaLayerSize]);
   useEffect(() => {
@@ -1657,7 +1850,7 @@ export function CompositionCanvas() {
 
           if (activeTool === "mask") {
             event.preventDefault();
-            const selectedLayer = composition.layers.find((layer) => layer.id === selectedLayerIds[0] && !layer.locked && layer.type !== "null" && layer.type !== "audio" && layer.type !== "adjustment");
+            const selectedLayer = composition.layers.find((layer) => layer.id === selectedLayerIds[0] && !layer.locked && layer.type !== "null" && layer.type !== "audio" && layer.type !== "adjustment" && layer.type !== "model");
             const targetLayer = selectedLayer ?? hit;
             if (!targetLayer) return;
             if (!selectedLayerIds.includes(targetLayer.id)) selectLayer(targetLayer.id);
@@ -1735,7 +1928,8 @@ export function CompositionCanvas() {
           updateTransformValue(drag.layerId, "position", [
             drag.startPosition[0] + point[0] - drag.startPoint[0],
             drag.startPosition[1] + point[1] - drag.startPoint[1],
-          ]);
+            ...(drag.startPosition.length >= 3 ? [drag.startPosition[2] ?? 0] : []),
+          ] as never);
         }}
         onPointerUp={(event) => {
           dragRef.current = null;

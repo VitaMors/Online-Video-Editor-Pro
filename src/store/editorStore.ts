@@ -271,9 +271,14 @@ function cloneAnimatableProperty<T>(property: AnimatableProperty<T>): Animatable
 }
 
 function cloneTransformProperties(transform: TransformProperties): TransformProperties {
+  const rotationX = transform.rotationX ?? { value: 0, animated: false, keyframes: [] };
+  const rotationY = transform.rotationY ?? { value: 0, animated: false, keyframes: [] };
+
   return {
     position: cloneAnimatableProperty(transform.position),
     scale: cloneAnimatableProperty(transform.scale),
+    rotationX: cloneAnimatableProperty(rotationX),
+    rotationY: cloneAnimatableProperty(rotationY),
     rotation: cloneAnimatableProperty(transform.rotation),
     opacity: cloneAnimatableProperty(transform.opacity),
     anchorPoint: cloneAnimatableProperty(transform.anchorPoint),
@@ -368,7 +373,7 @@ function selectedKeyframes(state: EditorState) {
     return mask ? (mask[state.selectedMaskProperty].keyframes as unknown as Keyframe[]) : [];
   }
 
-  return layer.transform[state.selectedProperty].keyframes;
+  return layer.transform[state.selectedProperty]?.keyframes ?? [];
 }
 
 function easePreset(preset: EasePreset): Partial<Keyframe<AnimatableValue>> {
@@ -380,11 +385,14 @@ function easePreset(preset: EasePreset): Partial<Keyframe<AnimatableValue>> {
 }
 
 function defaultValue(layer: Layer, property: TransformPropertyKey): AnimatableValue {
-  if (property === "scale") return [100, 100];
-  if (property === "rotation") return 0;
+  const isModel = layer.type === "model";
+  if (property === "scale") return isModel ? [100, 100, 100] : [100, 100];
+  if (property === "rotation" || property === "rotationX" || property === "rotationY") return 0;
   if (property === "opacity") return 100;
   if (property === "anchorPoint") {
-    return [(layer.source?.width ?? 320) / 2, (layer.source?.height ?? 180) / 2];
+    const width = (layer.source?.width ?? 320) / 2;
+    const height = (layer.source?.height ?? 180) / 2;
+    return isModel ? [width, height, (layer.source?.depth ?? 0) / 2] : [width, height];
   }
   return cloneValue(layer.transform.position.value);
 }
@@ -788,9 +796,10 @@ export const useEditorStore = create<EditorState>()(
         const name = file.name.replace(/\.[^.]+$/, "") || "Imported Media";
         const isVideo = file.type.startsWith("video/") || /\.mp4$/i.test(file.name);
         const isAudio = file.type.startsWith("audio/") || /\.(mp3|wav)$/i.test(file.name);
-        const type = isAudio ? "audio" : isVideo ? "video" : "image";
-        const fallbackWidth = isAudio ? 520 : 640;
-        const fallbackHeight = isAudio ? 80 : 360;
+        const isModel = /\.(glb|gltf)$/i.test(file.name) || file.type === "model/gltf-binary" || file.type === "model/gltf+json";
+        const type = isModel ? "model" : isAudio ? "audio" : isVideo ? "video" : "image";
+        const fallbackWidth = isAudio ? 520 : isModel ? 420 : 640;
+        const fallbackHeight = isAudio ? 80 : isModel ? 420 : 360;
         let importedLayerId: string | undefined;
 
         set((state) => {
@@ -799,11 +808,13 @@ export const useEditorStore = create<EditorState>()(
 
           const layer = createLayer(type, composition, {
             name,
-            source: isAudio
-              ? { fileName: file.name, audioUrl: mediaUrl, width: fallbackWidth, height: fallbackHeight }
-              : isVideo
-                ? { fileName: file.name, videoUrl: mediaUrl, width: fallbackWidth, height: fallbackHeight }
-                : { fileName: file.name, imageUrl: mediaUrl, width: fallbackWidth, height: fallbackHeight },
+            source: isModel
+              ? { fileName: file.name, modelUrl: mediaUrl, modelFormat: /\.gltf$/i.test(file.name) ? "gltf" : "glb", width: fallbackWidth, height: fallbackHeight, depth: fallbackWidth }
+              : isAudio
+                ? { fileName: file.name, audioUrl: mediaUrl, width: fallbackWidth, height: fallbackHeight }
+                : isVideo
+                  ? { fileName: file.name, videoUrl: mediaUrl, width: fallbackWidth, height: fallbackHeight }
+                  : { fileName: file.name, imageUrl: mediaUrl, width: fallbackWidth, height: fallbackHeight },
           });
           importedLayerId = layer.id;
 
@@ -823,6 +834,8 @@ export const useEditorStore = create<EditorState>()(
         if (!importedLayerId) return;
 
         const layerId = importedLayerId;
+        if (isModel) return;
+
         if (isAudio) {
           readAudioMetadata(mediaUrl)
             .then(({ durationSeconds }) => get().updateMediaLayerDuration(layerId, durationSeconds))
@@ -857,9 +870,9 @@ export const useEditorStore = create<EditorState>()(
               const oldWidth = previousWidth ?? layer.source?.width ?? 320;
               const oldHeight = previousHeight ?? layer.source?.height ?? 180;
               const oldAnchor: [number, number] = [oldWidth / 2, oldHeight / 2];
-              const nextAnchor: [number, number] = [safeWidth / 2, safeHeight / 2];
               const anchorPoint = layer.transform.anchorPoint;
               const currentAnchor = anchorPoint.value;
+              const nextAnchor = (currentAnchor.length >= 3 ? [safeWidth / 2, safeHeight / 2, currentAnchor[2] ?? 0] : [safeWidth / 2, safeHeight / 2]) as typeof currentAnchor;
               const shouldRecenterAnchor =
                 !anchorPoint.animated &&
                 Math.abs(currentAnchor[0] - oldAnchor[0]) < 0.01 &&

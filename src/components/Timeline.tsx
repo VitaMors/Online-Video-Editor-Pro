@@ -7,6 +7,7 @@ import type { Effect, EffectPropertyKey, Layer, Mask, MaskPropertyKey, Transform
 
 const labelWidth = 280;
 const transformRows: TransformPropertyKey[] = ["position", "scale", "rotation", "opacity"];
+const modelTransformRows: TransformPropertyKey[] = ["position", "scale", "rotationX", "rotationY", "rotation", "opacity"];
 const maskRows: MaskPropertyKey[] = ["path", "feather", "position", "scale"];
 const rowHeight = 28;
 const rulerHeight = 30;
@@ -109,7 +110,8 @@ export function Timeline({ mobile = false }: TimelineProps) {
       const layerRow: TimelineRow = { kind: "layer", layer };
       if (!expanded) return [layerRow];
 
-      const transformPropertyRows = transformRows.map<TimelineRow>((property) => ({ kind: "property", layer, property }));
+      const currentTransformRows = layer.type === "model" ? modelTransformRows : transformRows;
+      const transformPropertyRows = currentTransformRows.map<TimelineRow>((property) => ({ kind: "property", layer, property }));
       const timeRemapRows = layer.type === "video" && layer.source?.timeRemap
         ? [{ kind: "timeRemap", layer } satisfies TimelineRow]
         : [];
@@ -254,7 +256,7 @@ export function Timeline({ mobile = false }: TimelineProps) {
               const y = rulerHeight + index * rowHeight;
               const selected = rowSelected(row);
               const key = rowKey(row);
-              const propertyKeyframes = row.kind === "property" ? row.layer.transform[row.property].keyframes : [];
+              const propertyKeyframes = row.kind === "property" ? row.layer.transform[row.property]?.keyframes ?? [] : [];
               const timeRemapKeyframes = row.kind === "timeRemap" ? row.layer.source?.timeRemap?.keyframes ?? [] : [];
               const maskKeyframes = row.kind === "maskProperty" ? row.mask[row.property].keyframes : [];
               const effectControl = row.kind === "effectProperty" ? row.effect.controls[row.property] : undefined;

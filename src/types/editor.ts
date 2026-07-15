@@ -1,10 +1,12 @@
-export type LayerType = "text" | "shape" | "image" | "video" | "audio" | "solid" | "adjustment" | "null";
+export type LayerType = "text" | "shape" | "image" | "video" | "audio" | "model" | "solid" | "adjustment" | "null";
 export type InterpolationType = "linear" | "bezier" | "hold";
 export type GraphMode = "value" | "speed";
 export type EditorTool = "select" | "mask";
 export type Vector2 = [number, number];
+export type Vector3 = [number, number, number];
+export type SpatialVector = Vector2 | Vector3;
 export type MaskPath = Vector2[];
-export type AnimatableValue = number | Vector2;
+export type AnimatableValue = number | Vector2 | Vector3;
 
 export type Keyframe<T = AnimatableValue> = {
   id: string;
@@ -15,8 +17,8 @@ export type Keyframe<T = AnimatableValue> = {
   easeOut: number;
   velocityIn: number;
   velocityOut: number;
-  velocityInComponents?: Vector2;
-  velocityOutComponents?: Vector2;
+  velocityInComponents?: number[];
+  velocityOutComponents?: number[];
 };
 
 export type AnimatableProperty<T> = {
@@ -26,11 +28,13 @@ export type AnimatableProperty<T> = {
 };
 
 export type TransformProperties = {
-  position: AnimatableProperty<Vector2>;
-  scale: AnimatableProperty<Vector2>;
+  position: AnimatableProperty<SpatialVector>;
+  scale: AnimatableProperty<SpatialVector>;
+  rotationX: AnimatableProperty<number>;
+  rotationY: AnimatableProperty<number>;
   rotation: AnimatableProperty<number>;
   opacity: AnimatableProperty<number>;
-  anchorPoint: AnimatableProperty<Vector2>;
+  anchorPoint: AnimatableProperty<SpatialVector>;
 };
 
 export type TransformPropertyKey = keyof TransformProperties;
@@ -81,12 +85,15 @@ export type LayerSource = {
   imageUrl?: string;
   videoUrl?: string;
   audioUrl?: string;
+  modelUrl?: string;
+  modelFormat?: "glb" | "gltf";
   mediaOffsetFrames?: number;
   mediaDurationFrames?: number;
   timeRemap?: AnimatableProperty<number>;
   shape?: "rectangle" | "ellipse";
   width?: number;
   height?: number;
+  depth?: number;
 };
 
 export type Layer = {

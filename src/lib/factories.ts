@@ -6,6 +6,7 @@ import type {
   LayerSource,
   LayerType,
   Project,
+  SpatialVector,
   TransformProperties,
 } from "../types/editor";
 
@@ -23,15 +24,22 @@ export function animatable<T>(value: T): AnimatableProperty<T> {
 }
 
 export function createTransform(
-  position: [number, number],
-  size: [number, number],
+  position: SpatialVector,
+  size: SpatialVector,
 ): TransformProperties {
+  const is3D = position.length >= 3 || size.length >= 3;
+  const positionValue = (is3D ? [position[0], position[1], position[2] ?? 0] : [position[0], position[1]]) as SpatialVector;
+  const scaleValue = (is3D ? [100, 100, 100] : [100, 100]) as SpatialVector;
+  const anchorValue = (is3D ? [size[0] / 2, size[1] / 2, (size[2] ?? 0) / 2] : [size[0] / 2, size[1] / 2]) as SpatialVector;
+
   return {
-    position: animatable(position),
-    scale: animatable([100, 100]),
+    position: animatable(positionValue),
+    scale: animatable(scaleValue),
+    rotationX: animatable(0),
+    rotationY: animatable(0),
     rotation: animatable(0),
     opacity: animatable(100),
-    anchorPoint: animatable([size[0] / 2, size[1] / 2]),
+    anchorPoint: animatable(anchorValue),
   };
 }
 
@@ -60,6 +68,10 @@ function sourceForType(type: LayerType): LayerSource {
     return { width: 520, height: 80 };
   }
 
+  if (type === "model") {
+    return { width: 420, height: 420, depth: 420 };
+  }
+
   if (type === "adjustment") {
     return { width: 1920, height: 1080 };
   }
@@ -74,6 +86,7 @@ function layerName(type: LayerType) {
     image: "Image Layer",
     video: "Video Layer",
     audio: "Audio Layer",
+    model: "3D Model Layer",
     solid: "Solid Layer",
     adjustment: "Adjustment Layer",
     null: "Null Layer",
@@ -94,6 +107,9 @@ export function createLayer(
   };
   const width = source.width ?? 320;
   const height = source.height ?? 180;
+  const depth = source.depth ?? Math.max(width, height);
+  const defaultPosition = (type === "model" ? [composition.width / 2, composition.height / 2, 0] : [composition.width / 2, composition.height / 2]) as SpatialVector;
+  const defaultSize = (type === "model" ? [width, height, depth] : [width, height]) as SpatialVector;
 
   return {
     id: createId("layer"),
@@ -109,7 +125,7 @@ export function createLayer(
     blendMode: "normal",
     transform:
       overrides.transform ??
-      createTransform([composition.width / 2, composition.height / 2], [width, height]),
+      createTransform(defaultPosition, defaultSize),
     masks: overrides.masks ?? [],
     effects: overrides.effects ?? [],
     source,

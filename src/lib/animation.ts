@@ -17,6 +17,10 @@ function isVector2(value: unknown): value is Vector2 {
   return Array.isArray(value) && value.length >= 2 && typeof value[0] === "number" && typeof value[1] === "number";
 }
 
+function isNumericVector(value: unknown): value is number[] {
+  return Array.isArray(value) && value.length > 0 && value.every((item) => typeof item === "number" && Number.isFinite(item));
+}
+
 function isMaskPath(value: unknown): value is MaskPath {
   return Array.isArray(value) && value.every(isVector2);
 }
@@ -26,8 +30,8 @@ export function cloneValue<T>(value: T): T {
     return value.map((point) => [point[0], point[1]]) as T;
   }
 
-  if (isVector2(value)) {
-    return [value[0], value[1]] as T;
+  if (isNumericVector(value)) {
+    return [...value] as T;
   }
 
   return value;
@@ -37,7 +41,7 @@ export function keyframeSort<T>(a: Keyframe<T>, b: Keyframe<T>) {
   return a.frame - b.frame;
 }
 
-export function keyframeVelocity(keyframe: Keyframe, side: "in" | "out", component: 0 | 1 = 0) {
+export function keyframeVelocity(keyframe: Keyframe, side: "in" | "out", component = 0) {
   const components = side === "in" ? keyframe.velocityInComponents : keyframe.velocityOutComponents;
   const fallback = side === "in" ? keyframe.velocityIn : keyframe.velocityOut;
   return components?.[component] ?? fallback;
@@ -47,7 +51,12 @@ export function interpolateValue<T extends AnimatableValue>(from: T, to: T, amou
   const t = clamp(amount, 0, 1);
 
   if (Array.isArray(from) && Array.isArray(to)) {
-    return [from[0] + (to[0] - from[0]) * t, from[1] + (to[1] - from[1]) * t] as T;
+    const length = Math.max(from.length, to.length);
+    return Array.from({ length }, (_, index) => {
+      const start = typeof from[index] === "number" ? from[index] : to[index] ?? 0;
+      const end = typeof to[index] === "number" ? to[index] : start;
+      return start + (end - start) * t;
+    }) as T;
   }
 
   return ((from as number) + ((to as number) - (from as number)) * t) as T;
@@ -98,7 +107,7 @@ function solveBezierTForX(x1: number, x2: number, x: number) {
   return t;
 }
 
-function bezierComponent(from: number, to: number, left: Keyframe, right: Keyframe, rawT: number, component: 0 | 1) {
+function bezierComponent(from: number, to: number, left: Keyframe, right: Keyframe, rawT: number, component: number) {
   const frameSpan = Math.max(1, right.frame - left.frame);
   const influences = normalizedInfluences(left, right);
   const x1 = influences.out;
@@ -114,10 +123,12 @@ function bezierComponent(from: number, to: number, left: Keyframe, right: Keyfra
 
 function interpolateBezierValue<T extends AnimatableValue>(from: T, to: T, left: Keyframe, right: Keyframe, rawT: number): T {
   if (Array.isArray(from) && Array.isArray(to)) {
-    return [
-      bezierComponent(from[0], to[0], left, right, rawT, 0),
-      bezierComponent(from[1], to[1], left, right, rawT, 1),
-    ] as T;
+    const length = Math.max(from.length, to.length);
+    return Array.from({ length }, (_, index) => {
+      const start = typeof from[index] === "number" ? from[index] : to[index] ?? 0;
+      const end = typeof to[index] === "number" ? to[index] : start;
+      return bezierComponent(start, end, left, right, rawT, index);
+    }) as T;
   }
 
   return bezierComponent(from as number, to as number, left, right, rawT, 0) as T;
@@ -205,8 +216,8 @@ export function createKeyframe<T>(
     easeOut: 33,
     velocityIn: 0,
     velocityOut: 0,
-    velocityInComponents: isVector2(value) ? [0, 0] : undefined,
-    velocityOutComponents: isVector2(value) ? [0, 0] : undefined,
+    velocityInComponents: isNumericVector(value) ? value.map(() => 0) : undefined,
+    velocityOutComponents: isNumericVector(value) ? value.map(() => 0) : undefined,
   };
 }
 
@@ -242,16 +253,17 @@ export function getWorldPosition(
   visited = new Set<string>(),
 ): Vector2 {
   const local = evaluateProperty(layer.transform.position, frame);
+  const local2D: Vector2 = [local[0], local[1]];
 
   if (!layer.parentId || visited.has(layer.id)) {
-    return local;
+    return local2D;
   }
 
   visited.add(layer.id);
   const parent = composition.layers.find((candidate) => candidate.id === layer.parentId);
 
   if (!parent) {
-    return local;
+    return local2D;
   }
 
   const parentPosition = getWorldPosition(composition, parent, frame, visited);
@@ -267,7 +279,9 @@ export function propertyLabel(property: TransformPropertyKey) {
   const labels: Record<TransformPropertyKey, string> = {
     position: "Position",
     scale: "Scale",
-    rotation: "Rotation",
+    rotationX: "X Rotation",
+    rotationY: "Y Rotation",
+    rotation: "Z Rotation",
     opacity: "Opacity",
     anchorPoint: "Anchor Point",
   };
