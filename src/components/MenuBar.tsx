@@ -5,6 +5,9 @@ import type { Composition, EditorTool, EffectType, LayerType, Project } from "..
 
 type MenuName = "File" | "Edit" | "Comp" | "Layer" | "Effects" | "Select";
 
+const EXPORT_VIDEO_EVENT = "bbvep:export-composition-video";
+const EXPORT_VIDEO_STATUS_EVENT = "bbvep:export-composition-video-status";
+
 type MenuAction = {
   label: string;
   disabled?: boolean;
@@ -227,17 +230,25 @@ export function MenuBar() {
     noticeTimeoutRef.current = window.setTimeout(() => setNotice(null), 3200);
   };
 
+  useEffect(() => {
+    const onVideoExportStatus = (event: Event) => {
+      const detail = (event as CustomEvent<{ message?: string }>).detail;
+      if (detail?.message) showNotice(detail.message);
+    };
+
+    window.addEventListener(EXPORT_VIDEO_STATUS_EVENT, onVideoExportStatus);
+    return () => window.removeEventListener(EXPORT_VIDEO_STATUS_EVENT, onVideoExportStatus);
+  }, []);
+
   const selectedLayer = activeComposition?.layers.find((layer) => layer.id === selectedLayerIds[0]);
   const selectedVideoLayer = selectedLayer?.type === "video" ? selectedLayer : undefined;
   const selectedEffectsLayer = selectedLayer && selectedLayer.type !== "audio" && selectedLayer.type !== "null" ? selectedLayer : undefined;
   const close = () => setOpenMenu(null);
+  const createComposition = () => addComposition();
   const layerAction = (type: LayerType) => () => addLayer(type);
   const toolAction = (tool: EditorTool) => () => setActiveTool(tool);
   const effectAction = (type: EffectType) => () => selectedEffectsLayer && addEffect(selectedEffectsLayer.id, type);
   const projectPayload = () => ({ kind: "ovepro-project", version: 1, project });
-  const compositionPayload = () => activeComposition
-    ? { kind: "ovepro-composition", version: 1, composition: activeComposition }
-    : null;
 
   const saveProjectFile = async () => {
     try {
@@ -257,39 +268,15 @@ export function MenuBar() {
     }
   };
 
-  const saveActiveCompositionFile = async () => {
-    const payload = compositionPayload();
-    if (!payload || !activeComposition) return false;
-    try {
-      const result = await saveJsonFile(
-        payload,
-        `${fileBaseName(activeComposition.name)}.ovecomp`,
-        "BBVEP Composition",
-        [".ovecomp", ".json"],
-      );
-      showNotice(result === "saved" ? "Composition saved" : "Composition download started");
-      return true;
-    } catch (error) {
-      if (isAbortError(error)) return false;
-      downloadBlob(jsonBlob(payload), `${fileBaseName(activeComposition.name)}.ovecomp`);
-      showNotice("Composition download started");
-      return true;
-    }
-  };
-
-  const createComposition = () => {
-    const suggestedName = `Composition ${compositions.length + 1}`;
-    const name = window.prompt("Composition name", suggestedName);
-    if (name === null) return;
-    addComposition({
-      name: name.trim() || suggestedName,
-      width: activeComposition?.width ?? 1920,
-      height: activeComposition?.height ?? 1080,
-      fps: activeComposition?.fps ?? 30,
-      durationFrames: activeComposition?.durationFrames ?? 300,
-      backgroundColor: activeComposition?.backgroundColor ?? "#10151d",
-      backgroundTransparent: activeComposition?.backgroundTransparent ?? false,
-    });
+  const exportActiveCompositionVideo = () => {
+    if (!activeComposition) return;
+    window.dispatchEvent(new CustomEvent(EXPORT_VIDEO_EVENT, {
+      detail: {
+        compositionId: activeComposition.id,
+        filename: fileBaseName(activeComposition.name),
+      },
+    }));
+    showNotice("Rendering video 0%");
   };
 
   const openCompositionSettings = () => {
@@ -359,7 +346,7 @@ export function MenuBar() {
       { label: "Open Project", action: () => projectInputRef.current?.click() },
       { label: "Save Project", action: () => void saveProjectFile() },
       { label: "Import Composition", action: () => compositionInputRef.current?.click() },
-      { label: "Export Active Composition", action: () => void saveActiveCompositionFile(), disabled: !activeComposition },
+      { label: "Export Active Composition as MP4", action: exportActiveCompositionVideo, disabled: !activeComposition },
       { label: "Import Media", action: () => imageInputRef.current?.click() },
     ],
     Edit: [
@@ -375,7 +362,7 @@ export function MenuBar() {
       { label: "New Composition", action: createComposition },
       { label: "New Adjustment Layer", action: layerAction("adjustment"), disabled: !activeComposition },
       { label: "Import Composition", action: () => compositionInputRef.current?.click() },
-      { label: "Export Active Composition", action: () => void saveActiveCompositionFile(), disabled: !activeComposition },
+      { label: "Export Active Composition as MP4", action: exportActiveCompositionVideo, disabled: !activeComposition },
       { label: isPlaying ? "Pause" : "Play", action: togglePlayback },
       { label: showGrid ? "Hide Grid" : "Show Grid", action: toggleGrid },
       { label: showGuides ? "Hide Guides" : "Show Guides", action: toggleGuides },

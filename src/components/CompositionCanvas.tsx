@@ -27,6 +27,8 @@ type CachedVideoFrame = {
   height: number;
 };
 
+const EXPORT_VIDEO_EVENT = "bbvep:export-composition-video";
+const EXPORT_VIDEO_STATUS_EVENT = "bbvep:export-composition-video-status";
 const videoFrameCache = new Map<string, CachedVideoFrame>();
 
 function shouldDrawLayer(layer: Layer, frame: number, soloActive: boolean) {
@@ -933,6 +935,87 @@ function drawDraftMask(
   context.restore();
 }
 
+
+type RenderCompositionFrameOptions = {
+  images: Map<string, HTMLImageElement>;
+  videos: Map<string, HTMLVideoElement>;
+  selectedLayerIds?: string[];
+  selectedMaskId?: string;
+  maskDraft?: MaskDraft | null;
+  showGrid?: boolean;
+  showGuides?: boolean;
+  showBounds?: boolean;
+  showTransparencyGrid?: boolean;
+  includeOverlays?: boolean;
+  liveVideoPlayback?: boolean;
+};
+
+function renderCompositionFrame(
+  context: CanvasRenderingContext2D,
+  composition: Composition,
+  frame: number,
+  options: RenderCompositionFrameOptions,
+) {
+  const selectedLayerIds = options.selectedLayerIds ?? [];
+  const showBounds = options.showBounds ?? false;
+
+  context.clearRect(0, 0, composition.width, composition.height);
+  if (composition.backgroundTransparent) {
+    if (options.showTransparencyGrid) drawTransparencyGrid(context, composition);
+  } else {
+    context.fillStyle = composition.backgroundColor;
+    context.fillRect(0, 0, composition.width, composition.height);
+  }
+
+  if (options.showGrid) drawGrid(context, composition);
+
+  const soloActive = composition.layers.some((layer) => layer.solo);
+  const drawableLayers = composition.layers
+    .slice()
+    .reverse()
+    .filter((layer) => shouldDrawLayer(layer, frame, soloActive));
+  const contentCanvas = document.createElement("canvas");
+  contentCanvas.width = Math.max(1, Math.round(composition.width));
+  contentCanvas.height = Math.max(1, Math.round(composition.height));
+  const contentContext = contentCanvas.getContext("2d");
+
+  if (contentContext) {
+    drawableLayers.forEach((layer) => {
+      if (layer.type === "adjustment") {
+        applyAdjustmentLayerToCanvas(contentCanvas, layer, frame);
+        return;
+      }
+      drawLayer(contentContext, composition, layer, frame, options.images, options.videos, false, options.selectedMaskId, options.liveVideoPlayback);
+    });
+    context.drawImage(contentCanvas, 0, 0, composition.width, composition.height);
+  } else {
+    drawableLayers
+      .filter((layer) => layer.type !== "adjustment")
+      .forEach((layer) => drawLayer(context, composition, layer, frame, options.images, options.videos, false, options.selectedMaskId, options.liveVideoPlayback));
+  }
+
+  if (options.includeOverlays) {
+    drawableLayers
+      .filter((layer) => selectedLayerIds.includes(layer.id))
+      .forEach((layer) => {
+        if (layer.type === "adjustment") drawAdjustmentLayerOverlay(context, composition);
+        else drawLayerOverlay(context, composition, layer, frame, options.selectedMaskId);
+      });
+
+    if (options.maskDraft) {
+      const layer = composition.layers.find((candidate) => candidate.id === options.maskDraft?.layerId);
+      if (layer) drawDraftMask(context, composition, layer, frame, options.maskDraft);
+    }
+  }
+
+  if (options.showGuides) drawGuides(context, composition);
+
+  if (showBounds) {
+    context.strokeStyle = "#596579";
+    context.lineWidth = 3;
+    context.strokeRect(0, 0, composition.width, composition.height);
+  }
+}
 function hitTestLayer(composition: Composition, layer: Layer, frame: number, point: Vector2) {
   const [width, height] = getLayerSize(layer);
   const local = compositionToLayerPoint(composition, layer, frame, point);
@@ -987,6 +1070,235 @@ function maskScaleDragFactor(scale: Vector2, pointCount: number): Vector2 {
   return [Math.abs(factorX) < 0.001 ? 1 : factorX, Math.abs(factorY) < 0.001 ? 1 : factorY];
 }
 
+
+type ExportVideoDetail = {
+  compositionId?: string;
+  filename?: string;
+};
+
+type VideoExportStatusDetail = {
+  message: string;
+};
+
+function emitVideoExportStatus(message: string) {
+  window.dispatchEvent(new CustomEvent<VideoExportStatusDetail>(EXPORT_VIDEO_STATUS_EVENT, { detail: { message } }));
+}
+
+function videoExportFileBaseName(name: string) {
+  return name.trim().replace(/[^a-z0-9-_]+/gi, "-").replace(/^-+|-+$/g, "") || "composition";
+}
+
+function downloadVideoBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.rel = "noopener";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function bestVideoRecorderMimeType() {
+  if (typeof MediaRecorder === "undefined") return "";
+  return [
+    "video/mp4;codecs=avc1.42E01E",
+    "video/mp4",
+    "video/webm;codecs=vp9",
+    "video/webm;codecs=vp8",
+    "video/webm",
+  ].find((mimeType) => MediaRecorder.isTypeSupported(mimeType)) ?? "";
+}
+
+function extensionForRecorderMimeType(mimeType: string) {
+  return mimeType.includes("mp4") ? "mp4" : "webm";
+}
+
+function videoBitrateForComposition(composition: Composition) {
+  const fps = Math.max(1, Math.min(60, finiteNumber(composition.fps, 30)));
+  const pixels = Math.max(1, composition.width * composition.height);
+  return Math.round(Math.min(20_000_000, Math.max(2_500_000, pixels * fps * 0.09)));
+}
+
+function waitForExportDelay(milliseconds: number) {
+  return new Promise<void>((resolve) => window.setTimeout(resolve, Math.max(0, milliseconds)));
+}
+
+function waitForImageForExport(image: HTMLImageElement) {
+  if (image.complete && image.naturalWidth > 0) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const finish = () => {
+      image.removeEventListener("load", finish);
+      image.removeEventListener("error", finish);
+      resolve();
+    };
+    image.addEventListener("load", finish, { once: true });
+    image.addEventListener("error", finish, { once: true });
+    window.setTimeout(finish, 2500);
+  });
+}
+
+function waitForMediaMetadataForExport(media: HTMLMediaElement) {
+  if (media.readyState >= 1) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const finish = () => {
+      media.removeEventListener("loadedmetadata", finish);
+      media.removeEventListener("error", finish);
+      resolve();
+    };
+    media.addEventListener("loadedmetadata", finish, { once: true });
+    media.addEventListener("error", finish, { once: true });
+    media.load();
+    window.setTimeout(finish, 2500);
+  });
+}
+
+async function seekVideoForExport(video: HTMLVideoElement, time: number, tolerance = 0.045) {
+  await waitForMediaMetadataForExport(video);
+  if (Math.abs(video.currentTime - time) <= tolerance && video.readyState >= 2) return;
+
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      video.removeEventListener("seeked", finish);
+      video.removeEventListener("loadeddata", finish);
+      video.removeEventListener("error", finish);
+      resolve();
+    };
+    video.addEventListener("seeked", finish, { once: true });
+    video.addEventListener("loadeddata", finish, { once: true });
+    video.addEventListener("error", finish, { once: true });
+    safeSeekMedia(video, time);
+    window.setTimeout(finish, 1200);
+  });
+}
+
+async function waitForExportAssets(
+  composition: Composition,
+  images: Map<string, HTMLImageElement>,
+  videos: Map<string, HTMLVideoElement>,
+) {
+  const imageTasks = composition.layers
+    .map((layer) => layer.source?.imageUrl ? images.get(layer.source.imageUrl) : undefined)
+    .filter((image): image is HTMLImageElement => Boolean(image))
+    .map(waitForImageForExport);
+  const videoTasks = composition.layers
+    .map((layer) => layer.source?.videoUrl ? videos.get(layer.source.videoUrl) : undefined)
+    .filter((video): video is HTMLVideoElement => Boolean(video))
+    .map(waitForMediaMetadataForExport);
+  await Promise.all([...imageTasks, ...videoTasks]);
+}
+
+async function prepareVideosForExportFrame(
+  composition: Composition,
+  frame: number,
+  videos: Map<string, HTMLVideoElement>,
+) {
+  const soloActive = composition.layers.some((layer) => layer.solo);
+  const fps = finiteNumber(composition.fps, 30);
+
+  await Promise.all(composition.layers.map(async (layer) => {
+    const videoUrl = layer.source?.videoUrl;
+    if (!videoUrl || !shouldDrawLayer(layer, frame, soloActive)) return;
+    const video = videos.get(videoUrl);
+    if (!video) return;
+
+    const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
+    const targetTime = mediaTimeForFrame(layer, frame, fps, duration);
+
+    if (layer.source?.timeRemap) {
+      video.pause();
+      await seekVideoForExport(video, targetTime);
+      return;
+    }
+
+    if (video.readyState < 2 || Math.abs(video.currentTime - targetTime) > 0.28) {
+      await seekVideoForExport(video, targetTime, 0.08);
+    }
+
+    video.muted = true;
+    video.playbackRate = 1;
+    if (video.paused) await video.play().catch(() => undefined);
+  }));
+}
+
+async function exportCompositionVideo(
+  composition: Composition,
+  images: Map<string, HTMLImageElement>,
+  videos: Map<string, HTMLVideoElement>,
+  filename?: string,
+) {
+  if (!("captureStream" in HTMLCanvasElement.prototype)) {
+    throw new Error("This browser cannot record canvas video exports.");
+  }
+
+  const mimeType = bestVideoRecorderMimeType();
+  if (!mimeType) throw new Error("This browser does not expose a supported video recorder.");
+
+  await waitForExportAssets(composition, images, videos);
+
+  const fps = Math.max(1, Math.min(60, finiteNumber(composition.fps, 30)));
+  const durationFrames = Math.max(1, Math.round(finiteNumber(composition.durationFrames, fps * 10)));
+  const exportCanvas = document.createElement("canvas");
+  exportCanvas.width = Math.max(1, Math.round(composition.width));
+  exportCanvas.height = Math.max(1, Math.round(composition.height));
+  const exportContext = exportCanvas.getContext("2d");
+  if (!exportContext) throw new Error("Could not create video export canvas.");
+
+  const stream = exportCanvas.captureStream(fps);
+  const videoTrack = stream.getVideoTracks()[0] as CanvasCaptureMediaStreamTrack | undefined;
+  const chunks: Blob[] = [];
+  const recorder = new MediaRecorder(stream, {
+    mimeType,
+    videoBitsPerSecond: videoBitrateForComposition(composition),
+  });
+  const stopped = new Promise<Blob>((resolve, reject) => {
+    recorder.ondataavailable = (event) => {
+      if (event.data.size > 0) chunks.push(event.data);
+    };
+    recorder.onerror = () => reject(new Error("Video export failed."));
+    recorder.onstop = () => resolve(new Blob(chunks, { type: mimeType }));
+  });
+
+  recorder.start(250);
+  const startedAt = performance.now();
+  const progressStep = Math.max(1, Math.round(fps));
+
+  for (let frame = 0; frame < durationFrames; frame += 1) {
+    await prepareVideosForExportFrame(composition, frame, videos);
+    renderCompositionFrame(exportContext, composition, frame, {
+      images,
+      videos,
+      includeOverlays: false,
+      showGrid: false,
+      showGuides: false,
+      showBounds: false,
+      showTransparencyGrid: false,
+      liveVideoPlayback: true,
+    });
+    videoTrack?.requestFrame();
+
+    if (frame === 0 || frame % progressStep === 0) {
+      const percent = Math.min(100, Math.round(((frame + 1) / durationFrames) * 100));
+      emitVideoExportStatus(`Rendering video ${percent}%`);
+    }
+
+    const nextFrameDueAt = startedAt + ((frame + 1) / fps) * 1000;
+    await waitForExportDelay(nextFrameDueAt - performance.now());
+  }
+
+  if (recorder.state !== "inactive") recorder.stop();
+  const blob = await stopped;
+  stream.getTracks().forEach((track) => track.stop());
+  videos.forEach((video) => video.pause());
+
+  const extension = extensionForRecorderMimeType(mimeType);
+  downloadVideoBlob(blob, `${videoExportFileBaseName(filename ?? composition.name)}.${extension}`);
+  emitVideoExportStatus(extension === "mp4" ? "MP4 export downloaded" : "MP4 unavailable in this browser, downloaded WebM video");
+}
 export function CompositionCanvas() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
@@ -994,6 +1306,7 @@ export function CompositionCanvas() {
   const imageCache = useRef(new Map<string, HTMLImageElement>());
   const videoCache = useRef(new Map<string, HTMLVideoElement>());
   const audioCache = useRef(new Map<string, HTMLAudioElement>());
+  const exportInProgressRef = useRef(false);
   const dragRef = useRef<DragState | null>(null);
   const [maskDraft, setMaskDraft] = useState<MaskDraft | null>(null);
   const [textEdit, setTextEdit] = useState<TextEdit | null>(null);
@@ -1024,6 +1337,32 @@ export function CompositionCanvas() {
     () => project.compositions.find((item) => item.id === activeCompositionId),
     [activeCompositionId, project.compositions],
   );
+
+  useEffect(() => {
+    const onExportVideo = (event: Event) => {
+      const detail = (event as CustomEvent<ExportVideoDetail>).detail ?? {};
+      if (!composition || (detail.compositionId && detail.compositionId !== composition.id)) return;
+      if (exportInProgressRef.current) {
+        emitVideoExportStatus("Video export already running");
+        return;
+      }
+
+      exportInProgressRef.current = true;
+      emitVideoExportStatus("Rendering video 0%");
+      void exportCompositionVideo(composition, imageCache.current, videoCache.current, detail.filename)
+        .catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : "Video export failed.";
+          emitVideoExportStatus(message);
+        })
+        .finally(() => {
+          exportInProgressRef.current = false;
+          if (!useEditorStore.getState().isPlaying) videoCache.current.forEach((video) => video.pause());
+        });
+    };
+
+    window.addEventListener(EXPORT_VIDEO_EVENT, onExportVideo);
+    return () => window.removeEventListener(EXPORT_VIDEO_EVENT, onExportVideo);
+  }, [composition]);
 
   const finishMaskDraft = (draft: MaskDraft | null) => {
     if (!draft || draft.points.length < 3) return;
@@ -1248,52 +1587,19 @@ export function CompositionCanvas() {
     context.save();
     context.translate(current.x, current.y);
     context.scale(current.scale, current.scale);
-    if (composition.backgroundTransparent) {
-      drawTransparencyGrid(context, composition);
-    } else {
-      context.fillStyle = composition.backgroundColor;
-      context.fillRect(0, 0, composition.width, composition.height);
-    }
-    if (showGrid) drawGrid(context, composition);
-    const soloActive = composition.layers.some((layer) => layer.solo);
-    const drawableLayers = composition.layers
-      .slice()
-      .reverse()
-      .filter((layer) => shouldDrawLayer(layer, playheadFrame, soloActive));
-    const contentCanvas = document.createElement("canvas");
-    contentCanvas.width = Math.max(1, Math.round(composition.width));
-    contentCanvas.height = Math.max(1, Math.round(composition.height));
-    const contentContext = contentCanvas.getContext("2d");
-
-    if (contentContext) {
-      drawableLayers.forEach((layer) => {
-        if (layer.type === "adjustment") {
-          applyAdjustmentLayerToCanvas(contentCanvas, layer, playheadFrame);
-          return;
-        }
-        drawLayer(contentContext, composition, layer, playheadFrame, imageCache.current, videoCache.current, false, selectedMaskId, isPlaying);
-      });
-      context.drawImage(contentCanvas, 0, 0, composition.width, composition.height);
-    } else {
-      drawableLayers
-        .filter((layer) => layer.type !== "adjustment")
-        .forEach((layer) => drawLayer(context, composition, layer, playheadFrame, imageCache.current, videoCache.current, false, selectedMaskId, isPlaying));
-    }
-
-    drawableLayers
-      .filter((layer) => selectedLayerIds.includes(layer.id))
-      .forEach((layer) => {
-        if (layer.type === "adjustment") drawAdjustmentLayerOverlay(context, composition);
-        else drawLayerOverlay(context, composition, layer, playheadFrame, selectedMaskId);
-      });
-    if (maskDraft) {
-      const layer = composition.layers.find((candidate) => candidate.id === maskDraft.layerId);
-      if (layer) drawDraftMask(context, composition, layer, playheadFrame, maskDraft);
-    }
-    if (showGuides) drawGuides(context, composition);
-    context.strokeStyle = "#596579";
-    context.lineWidth = 3;
-    context.strokeRect(0, 0, composition.width, composition.height);
+    renderCompositionFrame(context, composition, playheadFrame, {
+      images: imageCache.current,
+      videos: videoCache.current,
+      selectedLayerIds,
+      selectedMaskId,
+      maskDraft,
+      showGrid,
+      showGuides,
+      showBounds: true,
+      showTransparencyGrid: true,
+      includeOverlays: true,
+      liveVideoPlayback: isPlaying,
+    });
     context.restore();
   }, [canvasPan, canvasVersion, canvasZoom, composition, isPlaying, maskDraft, mediaVersion, playheadFrame, selectedLayerIds, selectedMaskId, showGrid, showGuides]);
 
