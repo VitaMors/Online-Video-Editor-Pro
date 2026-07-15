@@ -373,6 +373,7 @@ export function MenuBar() {
     ],
     Comp: [
       { label: "New Composition", action: createComposition },
+      { label: "New Adjustment Layer", action: layerAction("adjustment"), disabled: !activeComposition },
       { label: "Import Composition", action: () => compositionInputRef.current?.click() },
       { label: "Export Active Composition", action: () => void saveActiveCompositionFile(), disabled: !activeComposition },
       { label: isPlaying ? "Pause" : "Play", action: togglePlayback },
@@ -388,6 +389,7 @@ export function MenuBar() {
       { label: "New Text Layer", action: layerAction("text") },
       { label: "New Shape Layer", action: layerAction("shape") },
       { label: "New Solid Layer", action: layerAction("solid") },
+      { label: "New Adjustment Layer", action: layerAction("adjustment") },
       { label: "New Null Layer", action: layerAction("null") },
       { label: "Split Layer", action: splitSelectedLayers },
       { label: selectedVideoLayer?.source?.timeRemap ? "Disable Time Remapping" : "Enable Time Remapping", action: () => selectedVideoLayer && toggleTimeRemap(selectedVideoLayer.id), disabled: !selectedVideoLayer },

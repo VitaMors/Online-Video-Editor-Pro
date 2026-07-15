@@ -1,4 +1,4 @@
-import { ChevronRight, Eye, EyeOff, Image, Lock, Menu, Music, Square, Type, Unlock, Video, Wind } from "lucide-react";
+import { ChevronRight, Eye, EyeOff, Image, Lock, Menu, Music, SlidersHorizontal, Square, Type, Unlock, Video, Wind } from "lucide-react";
 import { useState } from "react";
 import type { DragEvent } from "react";
 import { useEditorStore } from "../store/editorStore";
@@ -11,6 +11,7 @@ const layerIcons: Record<LayerType, typeof Square> = {
   video: Video,
   audio: Music,
   solid: Square,
+  adjustment: SlidersHorizontal,
   null: ChevronRight,
 };
 

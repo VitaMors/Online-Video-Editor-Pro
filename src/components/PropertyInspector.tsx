@@ -1,5 +1,5 @@
 import { ChevronDown, ChevronUp, Clock3, Copy, Diamond, Link2, Link2Off, PanelRightClose, PanelRightOpen, Power, RotateCcw, SkipBack, SkipForward, Trash2 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { evaluatePathProperty, evaluateProperty, propertyLabel } from "../lib/animation";
 import { effectControlDefinition, effectDefinition, effectNumberValue, effectStaticValue, isEffectNumberControl } from "../lib/effects";
 import { useEditorStore } from "../store/editorStore";
@@ -331,7 +331,7 @@ export function PropertyInspector({ collapsed = false, onToggleCollapsed }: Prop
     const definition = effectControlDefinition(effect, property);
     const value = effectNumberValue(effect, property, playheadFrame);
     return (
-      <div className={`grid grid-cols-[118px_minmax(0,1fr)_60px] items-center gap-2 px-4 py-1.5 ${effectPropertyActive(effect, property) ? "bg-editor-panel2" : "bg-editor-panel2/35"}`} onClick={() => selectEffect(layer.id, effect.id, property)}>
+      <div key={`${effect.id}-${property}`} className={`grid grid-cols-[118px_minmax(0,1fr)_60px] items-center gap-2 px-4 py-1.5 ${effectPropertyActive(effect, property) ? "bg-editor-panel2" : "bg-editor-panel2/35"}`} onClick={() => selectEffect(layer.id, effect.id, property)}>
         <button className="flex min-w-0 items-center text-left text-[12px] text-editor-muted" onClick={() => selectEffect(layer.id, effect.id, property)}>
           <span className="truncate">{definition?.label ?? property}</span>
         </button>
@@ -345,7 +345,7 @@ export function PropertyInspector({ collapsed = false, onToggleCollapsed }: Prop
     const definition = effectControlDefinition(effect, property);
     const value = effectStaticValue(effect, property);
     return (
-      <div className={`grid grid-cols-[118px_minmax(0,1fr)] items-center gap-2 px-4 py-1.5 ${effectPropertyActive(effect, property) ? "bg-editor-panel2" : "bg-editor-panel2/35"}`} onClick={() => selectEffect(layer.id, effect.id, property)}>
+      <div key={`${effect.id}-${property}`} className={`grid grid-cols-[118px_minmax(0,1fr)] items-center gap-2 px-4 py-1.5 ${effectPropertyActive(effect, property) ? "bg-editor-panel2" : "bg-editor-panel2/35"}`} onClick={() => selectEffect(layer.id, effect.id, property)}>
         <button className="flex min-w-0 items-center text-left text-[12px] text-editor-muted" onClick={() => selectEffect(layer.id, effect.id, property)}>
           <span className="truncate">{definition?.label ?? property}</span>
         </button>
@@ -364,6 +364,44 @@ export function PropertyInspector({ collapsed = false, onToggleCollapsed }: Prop
     );
   };
 
+
+  const colorGradingPresetText = (effect: Effect) => {
+    const controls: Record<string, number | string | boolean> = {};
+    effectDefinition(effect).controls.forEach((control) => {
+      const value = effect.controls[control.key];
+      controls[control.key] = isEffectNumberControl(value) ? effectNumberValue(effect, control.key, playheadFrame) : typeof value === "boolean" ? value : String(value ?? "");
+    });
+    return JSON.stringify({ kind: "bbvep-color-grading-preset", version: 1, controls }, null, 2);
+  };
+
+  const exportColorGradingPreset = async (effect: Effect) => {
+    const text = colorGradingPresetText(effect);
+    try {
+      await navigator.clipboard.writeText(text);
+      window.alert("Color grading preset copied as JSON.");
+    } catch {
+      window.prompt("Copy color grading preset JSON", text);
+    }
+  };
+
+  const importColorGradingPreset = (effect: Effect) => {
+    const text = window.prompt("Paste color grading preset JSON");
+    if (!text) return;
+    try {
+      const payload = JSON.parse(text) as { controls?: Record<string, unknown> } & Record<string, unknown>;
+      const controls: Record<string, unknown> = payload.controls ?? payload;
+      effectDefinition(effect).controls.forEach((control) => {
+        if (!(control.key in controls)) return;
+        const value = controls[control.key];
+        if (control.kind === "number" && typeof value === "number") updateEffectNumberValue(layer.id, effect.id, control.key, value);
+        if (control.kind === "boolean" && typeof value === "boolean") updateEffectStaticValue(layer.id, effect.id, control.key, value);
+        if (control.kind === "color" && typeof value === "string") updateEffectStaticValue(layer.id, effect.id, control.key, value);
+      });
+    } catch {
+      window.alert("That does not look like a valid color grading preset.");
+    }
+  };
+
   const renderEffect = (effect: Effect, index: number) => {
     const definition = effectDefinition(effect);
     return (
@@ -378,9 +416,17 @@ export function PropertyInspector({ collapsed = false, onToggleCollapsed }: Prop
           <button className="icon-button h-6 w-6" title="Remove" onClick={(event) => { event.stopPropagation(); removeEffect(layer.id, effect.id); }}><Trash2 size={12} /></button>
         </div>
         <div className={`${effect.enabled === false ? "opacity-55" : ""}`}>
-          {definition.controls.map((control) => control.kind === "number"
-            ? renderEffectNumberRow(effect, control.key)
-            : renderEffectStaticRow(effect, control.key))}
+          {effect.type === "colorGrading" ? (
+            <div className="grid grid-cols-2 gap-2 px-4 py-2">
+              <button className="h-7 border border-editor-line bg-editor-shell text-[11px] text-editor-muted hover:border-editor-cyan hover:text-editor-cyan" style={{ borderRadius: 5 }} onClick={(event) => { event.stopPropagation(); void exportColorGradingPreset(effect); }}>Export JSON</button>
+              <button className="h-7 border border-editor-line bg-editor-shell text-[11px] text-editor-muted hover:border-editor-cyan hover:text-editor-cyan" style={{ borderRadius: 5 }} onClick={(event) => { event.stopPropagation(); importColorGradingPreset(effect); }}>Import JSON</button>
+            </div>
+          ) : null}
+          {definition.controls.map((control) => (
+            <Fragment key={`${effect.id}-${control.key}`}>
+              {control.kind === "number" ? renderEffectNumberRow(effect, control.key) : renderEffectStaticRow(effect, control.key)}
+            </Fragment>
+          ))}
         </div>
       </div>
     );

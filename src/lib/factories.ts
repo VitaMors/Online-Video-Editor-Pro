@@ -60,6 +60,10 @@ function sourceForType(type: LayerType): LayerSource {
     return { width: 520, height: 80 };
   }
 
+  if (type === "adjustment") {
+    return { width: 1920, height: 1080 };
+  }
+
   return { width: 640, height: 360 };
 }
 
@@ -71,6 +75,7 @@ function layerName(type: LayerType) {
     video: "Video Layer",
     audio: "Audio Layer",
     solid: "Solid Layer",
+    adjustment: "Adjustment Layer",
     null: "Null Layer",
   };
 
@@ -82,7 +87,11 @@ export function createLayer(
   composition: Pick<Composition, "width" | "height" | "durationFrames">,
   overrides: Partial<Layer> = {},
 ): Layer {
-  const source = { ...sourceForType(type), ...overrides.source };
+  const source = {
+    ...sourceForType(type),
+    ...(type === "adjustment" ? { width: composition.width, height: composition.height } : {}),
+    ...overrides.source,
+  };
   const width = source.width ?? 320;
   const height = source.height ?? 180;
 

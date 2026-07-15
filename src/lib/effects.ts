@@ -38,8 +38,28 @@ const mixControl: NumberControlDefinition = {
   max: 100,
   step: 1,
 };
+function numberControl(key: string, label: string, defaultValue: number, min: number, max: number, step: number): NumberControlDefinition {
+  return { key, label, kind: "number", defaultValue, min, max, step };
+}
+
+function channelHslControls(prefix: string, label: string): NumberControlDefinition[] {
+  return [
+    numberControl(`${prefix}Hue`, `${label} Hue`, 0, -180, 180, 1),
+    numberControl(`${prefix}Saturation`, `${label} Saturation`, 0, -100, 100, 1),
+    numberControl(`${prefix}Luminance`, `${label} Luminance`, 0, -100, 100, 1),
+  ];
+}
+
+function curveBandControls(prefix: string, label: string): NumberControlDefinition[] {
+  return [
+    numberControl(`${prefix}Shadows`, `${label} Shadows`, 0, -100, 100, 1),
+    numberControl(`${prefix}Midtones`, `${label} Midtones`, 0, -100, 100, 1),
+    numberControl(`${prefix}Highlights`, `${label} Highlights`, 0, -100, 100, 1),
+  ];
+}
 
 export const EFFECT_ORDER: EffectType[] = [
+  "colorGrading",
   "hueSaturation",
   "levels",
   "curves",
@@ -57,6 +77,44 @@ export const EFFECT_ORDER: EffectType[] = [
 ];
 
 export const EFFECT_DEFINITIONS: Record<EffectType, EffectDefinition> = {
+  colorGrading: {
+    type: "colorGrading",
+    label: "Color Grading & Balance",
+    controls: [
+      numberControl("inputSpace", "Input Space (0 Rec709, 1 Rec2020, 2 Log)", 0, 0, 2, 1),
+      numberControl("temperature", "Temperature", 0, -100, 100, 1),
+      numberControl("tint", "Tint", 0, -100, 100, 1),
+      numberControl("exposure", "Exposure", 0, -5, 5, 0.05),
+      numberControl("contrast", "Contrast", 1, 0.1, 3, 0.01),
+      numberControl("brightness", "Brightness", 0, -1, 1, 0.01),
+      numberControl("shadowLift", "Lift / Shadows", 0, -1, 1, 0.01),
+      numberControl("midtoneGamma", "Gamma / Midtones", 1, 0.1, 3, 0.01),
+      numberControl("highlightGain", "Gain / Highlights", 0, -1, 1, 0.01),
+      numberControl("masterHue", "Master Hue", 0, -180, 180, 1),
+      numberControl("masterSaturation", "Master Saturation", 0, -100, 100, 1),
+      numberControl("masterLuminance", "Master Luminance", 0, -100, 100, 1),
+      ...channelHslControls("red", "Red"),
+      ...channelHslControls("yellow", "Yellow"),
+      ...channelHslControls("green", "Green"),
+      ...channelHslControls("cyan", "Cyan"),
+      ...channelHslControls("blue", "Blue"),
+      ...channelHslControls("magenta", "Magenta"),
+      ...curveBandControls("redCurve", "Red Curve"),
+      ...curveBandControls("greenCurve", "Green Curve"),
+      ...curveBandControls("blueCurve", "Blue Curve"),
+      ...curveBandControls("saturationCurve", "Saturation Curve"),
+      { key: "qualifierEnabled", label: "Qualifier", kind: "boolean", defaultValue: false },
+      numberControl("qualifierHue", "Qualifier Hue", 0, 0, 360, 1),
+      numberControl("qualifierHueWidth", "Qualifier Hue Width", 35, 0, 180, 1),
+      numberControl("qualifierSatMin", "Qualifier Sat Min", 0, 0, 100, 1),
+      numberControl("qualifierSatMax", "Qualifier Sat Max", 100, 0, 100, 1),
+      numberControl("qualifierLumMin", "Qualifier Lum Min", 0, 0, 100, 1),
+      numberControl("qualifierLumMax", "Qualifier Lum Max", 100, 0, 100, 1),
+      { key: "clippingWarning", label: "Clipping Warning", kind: "boolean", defaultValue: false },
+      numberControl("scopeMode", "Scope Mode (0 Off, 1 Waveform, 2 Vectorscope, 3 Parade)", 0, 0, 3, 1),
+      mixControl,
+    ],
+  },
   hueSaturation: {
     type: "hueSaturation",
     label: "Hue/Saturation",

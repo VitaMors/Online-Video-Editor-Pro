@@ -1,4 +1,4 @@
-export type LayerType = "text" | "shape" | "image" | "video" | "audio" | "solid" | "null";
+export type LayerType = "text" | "shape" | "image" | "video" | "audio" | "solid" | "adjustment" | "null";
 export type InterpolationType = "linear" | "bezier" | "hold";
 export type GraphMode = "value" | "speed";
 export type EditorTool = "select" | "mask";
@@ -37,6 +37,7 @@ export type TransformPropertyKey = keyof TransformProperties;
 export type MaskPropertyKey = "path" | "feather" | "position" | "scale";
 export type SourcePropertyKey = "timeRemap";
 export type EffectType =
+  | "colorGrading"
   | "hueSaturation"
   | "levels"
   | "curves"

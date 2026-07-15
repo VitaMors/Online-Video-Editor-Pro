@@ -39,6 +39,7 @@ function projectFromPayload(payload: unknown) {
 
 export default function App() {
   const frameRemainder = useRef(0);
+  const playheadFrameRef = useRef(0);
   const splashProjectInputRef = useRef<HTMLInputElement | null>(null);
   const [showSplash, setShowSplash] = useState(true);
   const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
@@ -62,9 +63,14 @@ export default function App() {
   const selectProperty = useEditorStore((state) => state.selectProperty);
 
   useEffect(() => {
+    playheadFrameRef.current = playheadFrame;
+  }, [playheadFrame]);
+
+  useEffect(() => {
     if (!isPlaying || !composition || showSplash) return;
     let animationFrame = 0;
     let lastTime = performance.now();
+    frameRemainder.current = 0;
     const fps = Math.max(1, Math.round(typeof composition.fps === "number" && Number.isFinite(composition.fps) ? composition.fps : 30));
     const durationFrames = Math.max(1, Math.round(typeof composition.durationFrames === "number" && Number.isFinite(composition.durationFrames) ? composition.durationFrames : 300));
     const tick = (time: number) => {
@@ -74,14 +80,16 @@ export default function App() {
       const wholeFrames = Math.floor(frameRemainder.current);
       if (wholeFrames > 0) {
         frameRemainder.current -= wholeFrames;
-        const nextFrame = playheadFrame + wholeFrames;
-        setPlayheadFrame(nextFrame >= durationFrames ? 0 : nextFrame);
+        const nextFrame = playheadFrameRef.current + wholeFrames;
+        const wrappedFrame = nextFrame >= durationFrames ? nextFrame % durationFrames : nextFrame;
+        playheadFrameRef.current = wrappedFrame;
+        setPlayheadFrame(wrappedFrame);
       }
       animationFrame = requestAnimationFrame(tick);
     };
     animationFrame = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(animationFrame);
-  }, [composition, isPlaying, playheadFrame, setPlayheadFrame, showSplash]);
+  }, [composition, isPlaying, setPlayheadFrame, showSplash]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {

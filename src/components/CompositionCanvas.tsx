@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { evaluatePathProperty, evaluateProperty, getLayerSize, getWorldPosition } from "../lib/animation";
+import { applyColorGradingShader } from "../lib/colorGradingShader";
 import { effectNumberValue, effectStaticValue } from "../lib/effects";
 import { useEditorStore } from "../store/editorStore";
 import type { Composition, Effect, Layer, Mask, MaskPath, Vector2 } from "../types/editor";
@@ -19,6 +20,14 @@ type TextEdit = {
   layerId: string;
   value: string;
 };
+
+type CachedVideoFrame = {
+  canvas: HTMLCanvasElement;
+  width: number;
+  height: number;
+};
+
+const videoFrameCache = new Map<string, CachedVideoFrame>();
 
 function shouldDrawLayer(layer: Layer, frame: number, soloActive: boolean) {
   if (layer.visible === false || layer.type === "null" || layer.type === "audio") return false;
@@ -263,19 +272,50 @@ function hasEnoughPreviewBuffer(video: HTMLVideoElement, layer: Layer, frame: nu
   return videoPreviewBufferRatio(video, layer, frame, fps) >= 0.6;
 }
 
-function syncVideoToFrame(video: HTMLVideoElement, layer: Layer, frame: number, fps: number) {
-  if (video.readyState < 1) return;
-  const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
-  const targetTime = mediaTimeForFrame(layer, frame, fps, duration);
-  if (Math.abs(video.currentTime - targetTime) > 0.04 && !video.seeking) {
-    try {
-      video.currentTime = targetTime;
-    } catch {
-      // Some browsers reject seeks while metadata is still settling.
-    }
+function safeSeekMedia(media: HTMLMediaElement, time: number) {
+  try {
+    media.currentTime = time;
+  } catch {
+    // Some browsers reject seeks while metadata is still settling.
   }
 }
 
+function syncVideoToFrame(video: HTMLVideoElement, layer: Layer, frame: number, fps: number, tolerance = 0.04) {
+  if (video.readyState < 1) return;
+  const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
+  const targetTime = mediaTimeForFrame(layer, frame, fps, duration);
+  if (Math.abs(video.currentTime - targetTime) > tolerance && !video.seeking) {
+    safeSeekMedia(video, targetTime);
+  }
+}
+
+function videoCacheKey(videoUrl: string, width: number, height: number) {
+  return `${videoUrl}::${Math.max(1, Math.round(width))}x${Math.max(1, Math.round(height))}`;
+}
+
+function drawCachedVideoFrame(context: CanvasRenderingContext2D, videoUrl: string, width: number, height: number) {
+  const cached = videoFrameCache.get(videoCacheKey(videoUrl, width, height));
+  if (!cached) return false;
+  context.drawImage(cached.canvas, 0, 0, width, height);
+  return true;
+}
+
+function rememberVideoFrame(videoUrl: string, video: HTMLVideoElement, width: number, height: number) {
+  const cacheKey = videoCacheKey(videoUrl, width, height);
+  const pixelWidth = Math.max(1, Math.round(width));
+  const pixelHeight = Math.max(1, Math.round(height));
+  const cached = videoFrameCache.get(cacheKey);
+  const canvas = cached?.width === pixelWidth && cached.height === pixelHeight
+    ? cached.canvas
+    : document.createElement("canvas");
+  canvas.width = pixelWidth;
+  canvas.height = pixelHeight;
+  const context = canvas.getContext("2d");
+  if (!context) return;
+  context.clearRect(0, 0, pixelWidth, pixelHeight);
+  context.drawImage(video, 0, 0, pixelWidth, pixelHeight);
+  videoFrameCache.set(cacheKey, { canvas, width: pixelWidth, height: pixelHeight });
+}
 function drawLayerContent(
   context: CanvasRenderingContext2D,
   layer: Layer,
@@ -283,6 +323,7 @@ function drawLayerContent(
   videos: Map<string, HTMLVideoElement>,
   frame: number,
   fps: number,
+  liveVideoPlayback = false,
 ) {
   const [width, height] = getLayerSize(layer);
   const source = layer.source;
@@ -323,10 +364,18 @@ function drawLayerContent(
   if (layer.type === "video" && source?.videoUrl) {
     const video = videos.get(source.videoUrl);
     const enoughPreviewBuffer = video ? hasEnoughPreviewBuffer(video, layer, frame, fps) : false;
-    if (video) syncVideoToFrame(video, layer, frame, fps);
+    const playbackDriven = liveVideoPlayback && !source.timeRemap;
+    if (video && !playbackDriven) syncVideoToFrame(video, layer, frame, fps);
     if (video && video.readyState >= 2 && video.videoWidth > 0) {
-      context.drawImage(video, 0, 0, width, height);
-    } else {
+      try {
+        context.drawImage(video, 0, 0, width, height);
+        rememberVideoFrame(source.videoUrl, video, width, height);
+      } catch {
+        if (!drawCachedVideoFrame(context, source.videoUrl, width, height)) {
+          drawMediaPlaceholder(context, width, height, enoughPreviewBuffer ? "" : "Loading Video");
+        }
+      }
+    } else if (!drawCachedVideoFrame(context, source.videoUrl, width, height)) {
       drawMediaPlaceholder(context, width, height, enoughPreviewBuffer ? "" : "Loading Video");
     }
   }
@@ -608,7 +657,7 @@ function sharpenCanvas(source: HTMLCanvasElement, effect: Effect, frame: number)
 
 function applyEffectCanvas(source: HTMLCanvasElement, effect: Effect, frame: number) {
   if (effect.enabled === false) return source;
-
+  if (effect.type === "colorGrading") return applyColorGradingShader(source, effect, frame);
   if (effect.type === "hueSaturation") {
     const hue = effectNumberValue(effect, "hue", frame);
     const saturation = Math.max(0, 100 + effectNumberValue(effect, "saturation", frame));
@@ -640,6 +689,20 @@ function applyEffectCanvas(source: HTMLCanvasElement, effect: Effect, frame: num
 function applyLayerEffects(source: HTMLCanvasElement, layer: Layer, frame: number) {
   return layer.effects.reduce((canvas, effect) => applyEffectCanvas(canvas, effect, frame), source);
 }
+
+function applyAdjustmentLayerToCanvas(canvas: HTMLCanvasElement, layer: Layer, frame: number) {
+  if (layer.effects.length === 0) return;
+
+  const context = canvas.getContext("2d");
+  if (!context) return;
+
+  const processed = applyLayerEffects(canvas, layer, frame);
+  const opacity = clampUnit(evaluateProperty(layer.transform.opacity, frame) / 100);
+  const output = opacity < 0.999 ? blendCanvas(canvas, processed, opacity) : processed;
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  context.drawImage(output, 0, 0, canvas.width, canvas.height);
+}
+
 function maskCenter(points: MaskPath): Vector2 {
   if (points.length === 0) return [0, 0];
   const total = points.reduce<Vector2>((sum, point) => [sum[0] + point[0], sum[1] + point[1]], [0, 0]);
@@ -673,6 +736,7 @@ function drawMaskedLayerContent(
   images: Map<string, HTMLImageElement>,
   videos: Map<string, HTMLVideoElement>,
   fps: number,
+  liveVideoPlayback: boolean,
 ) {
   const [width, height] = getLayerSize(layer);
   const contentCanvas = document.createElement("canvas");
@@ -681,11 +745,11 @@ function drawMaskedLayerContent(
   const contentContext = contentCanvas.getContext("2d");
 
   if (!contentContext) {
-    drawLayerContent(context, layer, images, videos, frame, fps);
+    drawLayerContent(context, layer, images, videos, frame, fps, liveVideoPlayback);
     return;
   }
 
-  drawLayerContent(contentContext, layer, images, videos, frame, fps);
+  drawLayerContent(contentContext, layer, images, videos, frame, fps, liveVideoPlayback);
 
   if (layer.masks.length > 0) {
     const maskCanvas = document.createElement("canvas");
@@ -744,6 +808,47 @@ function drawMaskOutlines(context: CanvasRenderingContext2D, layer: Layer, frame
   });
 }
 
+function drawLayerOverlay(
+  context: CanvasRenderingContext2D,
+  composition: Composition,
+  layer: Layer,
+  frame: number,
+  selectedMaskId?: string,
+) {
+  const [width, height] = getLayerSize(layer);
+  context.save();
+  applyLayerTransform(context, composition, layer, frame);
+  context.globalAlpha = 1;
+  context.lineWidth = 3;
+  context.strokeStyle = "#f2b84b";
+  context.setLineDash([14, 8]);
+  context.strokeRect(0, 0, width, height);
+  context.setLineDash([]);
+  context.fillStyle = "#f2b84b";
+  const handle = 16;
+  [[0, 0], [width, 0], [width, height], [0, height]].forEach(([x, y]) => {
+    context.fillRect(x - handle / 2, y - handle / 2, handle, handle);
+  });
+  drawMaskOutlines(context, layer, frame, selectedMaskId);
+  context.restore();
+}
+
+function drawAdjustmentLayerOverlay(context: CanvasRenderingContext2D, composition: Composition) {
+  context.save();
+  context.globalAlpha = 1;
+  context.lineWidth = 3;
+  context.strokeStyle = "#f2b84b";
+  context.setLineDash([14, 8]);
+  context.strokeRect(0, 0, composition.width, composition.height);
+  context.setLineDash([]);
+  context.fillStyle = "#f2b84b";
+  const handle = 16;
+  [[0, 0], [composition.width, 0], [composition.width, composition.height], [0, composition.height]].forEach(([x, y]) => {
+    context.fillRect(x - handle / 2, y - handle / 2, handle, handle);
+  });
+  context.restore();
+}
+
 function transformMotionAmount(composition: Composition, layer: Layer, frame: number) {
   const previousFrame = Math.max(layer.startFrame, frame - 1);
   if (previousFrame === frame) return 0;
@@ -770,8 +875,8 @@ function drawLayer(
   videos: Map<string, HTMLVideoElement>,
   selected: boolean,
   selectedMaskId?: string,
+  liveVideoPlayback = false,
 ) {
-  const [width, height] = getLayerSize(layer);
   const fps = finiteNumber(composition.fps, 30);
   const motionAmount = composition.motionBlur && layer.motionBlur ? transformMotionAmount(composition, layer, frame) : 0;
   const sampleCount = motionAmount > 0.25 ? Math.min(8, Math.max(2, Math.ceil(motionAmount / 28))) : 1;
@@ -784,7 +889,7 @@ function drawLayer(
     context.save();
     context.globalAlpha = (opacity / 100) * alphaScale;
     applyLayerTransform(context, composition, layer, sampleFrame);
-    drawMaskedLayerContent(context, layer, contentFrame, images, videos, fps);
+    drawMaskedLayerContent(context, layer, contentFrame, images, videos, fps, liveVideoPlayback);
     context.restore();
   };
 
@@ -799,23 +904,7 @@ function drawLayer(
     drawContentSample(frame, 1);
   }
 
-  if (selected) {
-    context.save();
-    applyLayerTransform(context, composition, layer, frame);
-    context.globalAlpha = 1;
-    context.lineWidth = 3;
-    context.strokeStyle = "#f2b84b";
-    context.setLineDash([14, 8]);
-    context.strokeRect(0, 0, width, height);
-    context.setLineDash([]);
-    context.fillStyle = "#f2b84b";
-    const handle = 16;
-    [[0, 0], [width, 0], [width, height], [0, height]].forEach(([x, y]) => {
-      context.fillRect(x - handle / 2, y - handle / 2, handle, handle);
-    });
-    drawMaskOutlines(context, layer, frame, selectedMaskId);
-    context.restore();
-  }
+  if (selected) drawLayerOverlay(context, composition, layer, frame, selectedMaskId);
 }
 function drawDraftMask(
   context: CanvasRenderingContext2D,
@@ -959,7 +1048,7 @@ export function CompositionCanvas() {
     if (!canvas || !composition) return undefined;
     const point = screenToComposition(canvas, composition, canvasZoom, canvasPan, clientX, clientY);
     const soloActive = composition.layers.some((layer) => layer.solo);
-    return composition.layers.find((layer) => shouldDrawLayer(layer, playheadFrame, soloActive) && !layer.locked && hitTestLayer(composition, layer, playheadFrame, point));
+    return composition.layers.find((layer) => layer.type !== "adjustment" && shouldDrawLayer(layer, playheadFrame, soloActive) && !layer.locked && hitTestLayer(composition, layer, playheadFrame, point));
   };
 
   const hitMaskVertexAt = (clientX: number, clientY: number) => {
@@ -1046,6 +1135,38 @@ export function CompositionCanvas() {
       }
     });
   }, [composition, updateMediaLayerSize]);
+  useEffect(() => {
+    if (!composition) return;
+    const soloActive = composition.layers.some((layer) => layer.solo);
+    const fps = finiteNumber(composition.fps, 30);
+
+    composition.layers.forEach((layer) => {
+      const videoUrl = layer.source?.videoUrl;
+      if (!videoUrl) return;
+      const video = videoCache.current.get(videoUrl);
+      if (!video) return;
+
+      const active = layer.visible !== false && (!soloActive || layer.solo) && playheadFrame >= layer.startFrame && playheadFrame < layer.endFrame;
+      const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
+      const targetTime = mediaTimeForFrame(layer, playheadFrame, fps, duration);
+      const canUseLivePlayback = isPlaying && active && !layer.source?.timeRemap;
+
+      if (!canUseLivePlayback) {
+        video.pause();
+        if (active && Math.abs(video.currentTime - targetTime) > 0.05 && !video.seeking) {
+          safeSeekMedia(video, targetTime);
+        }
+        return;
+      }
+
+      video.muted = true;
+      video.playbackRate = 1;
+      if (Math.abs(video.currentTime - targetTime) > 0.25 && !video.seeking) {
+        safeSeekMedia(video, targetTime);
+      }
+      if (video.paused) void video.play().catch(() => undefined);
+    });
+  }, [composition, isPlaying, mediaVersion, playheadFrame]);
 
   useEffect(() => {
     if (!composition) return;
@@ -1135,11 +1256,36 @@ export function CompositionCanvas() {
     }
     if (showGrid) drawGrid(context, composition);
     const soloActive = composition.layers.some((layer) => layer.solo);
-    composition.layers
+    const drawableLayers = composition.layers
       .slice()
       .reverse()
-      .filter((layer) => shouldDrawLayer(layer, playheadFrame, soloActive))
-      .forEach((layer) => drawLayer(context, composition, layer, playheadFrame, imageCache.current, videoCache.current, selectedLayerIds.includes(layer.id), selectedMaskId));
+      .filter((layer) => shouldDrawLayer(layer, playheadFrame, soloActive));
+    const contentCanvas = document.createElement("canvas");
+    contentCanvas.width = Math.max(1, Math.round(composition.width));
+    contentCanvas.height = Math.max(1, Math.round(composition.height));
+    const contentContext = contentCanvas.getContext("2d");
+
+    if (contentContext) {
+      drawableLayers.forEach((layer) => {
+        if (layer.type === "adjustment") {
+          applyAdjustmentLayerToCanvas(contentCanvas, layer, playheadFrame);
+          return;
+        }
+        drawLayer(contentContext, composition, layer, playheadFrame, imageCache.current, videoCache.current, false, selectedMaskId, isPlaying);
+      });
+      context.drawImage(contentCanvas, 0, 0, composition.width, composition.height);
+    } else {
+      drawableLayers
+        .filter((layer) => layer.type !== "adjustment")
+        .forEach((layer) => drawLayer(context, composition, layer, playheadFrame, imageCache.current, videoCache.current, false, selectedMaskId, isPlaying));
+    }
+
+    drawableLayers
+      .filter((layer) => selectedLayerIds.includes(layer.id))
+      .forEach((layer) => {
+        if (layer.type === "adjustment") drawAdjustmentLayerOverlay(context, composition);
+        else drawLayerOverlay(context, composition, layer, playheadFrame, selectedMaskId);
+      });
     if (maskDraft) {
       const layer = composition.layers.find((candidate) => candidate.id === maskDraft.layerId);
       if (layer) drawDraftMask(context, composition, layer, playheadFrame, maskDraft);
@@ -1149,7 +1295,7 @@ export function CompositionCanvas() {
     context.lineWidth = 3;
     context.strokeRect(0, 0, composition.width, composition.height);
     context.restore();
-  }, [canvasPan, canvasVersion, canvasZoom, composition, maskDraft, mediaVersion, playheadFrame, selectedLayerIds, selectedMaskId, showGrid, showGuides]);
+  }, [canvasPan, canvasVersion, canvasZoom, composition, isPlaying, maskDraft, mediaVersion, playheadFrame, selectedLayerIds, selectedMaskId, showGrid, showGuides]);
 
   if (!composition) return null;
 
@@ -1172,7 +1318,7 @@ export function CompositionCanvas() {
           if (!canvas) return;
           const point = screenToComposition(canvas, composition, canvasZoom, canvasPan, event.clientX, event.clientY);
           const soloActive = composition.layers.some((layer) => layer.solo);
-          const hit = composition.layers.find((layer) => shouldDrawLayer(layer, playheadFrame, soloActive) && !layer.locked && hitTestLayer(composition, layer, playheadFrame, point));
+          const hit = composition.layers.find((layer) => layer.type !== "adjustment" && shouldDrawLayer(layer, playheadFrame, soloActive) && !layer.locked && hitTestLayer(composition, layer, playheadFrame, point));
 
           if (activeTool === "select" && event.detail > 1 && hit?.type === "text") {
             event.preventDefault();
@@ -1205,7 +1351,7 @@ export function CompositionCanvas() {
 
           if (activeTool === "mask") {
             event.preventDefault();
-            const selectedLayer = composition.layers.find((layer) => layer.id === selectedLayerIds[0] && !layer.locked && layer.type !== "null");
+            const selectedLayer = composition.layers.find((layer) => layer.id === selectedLayerIds[0] && !layer.locked && layer.type !== "null" && layer.type !== "audio" && layer.type !== "adjustment");
             const targetLayer = selectedLayer ?? hit;
             if (!targetLayer) return;
             if (!selectedLayerIds.includes(targetLayer.id)) selectLayer(targetLayer.id);
