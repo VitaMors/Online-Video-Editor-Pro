@@ -470,7 +470,20 @@ export function PropertyInspector({ collapsed = false, onToggleCollapsed }: Prop
               </div>
             )}
           </section>
-        ) : null}        <section className="border-b panel-divider">
+        ) : null}
+        <section className="border-b panel-divider">
+          <div className="flex h-10 items-center gap-2 px-4 text-[13px] font-semibold text-editor-ink">
+            <ChevronDown size={15} /> Effects
+          </div>
+          {layer.effects.length > 0 ? (
+            <div className="pb-3">
+              {layer.effects.map((effect, index) => renderEffect(effect, index))}
+            </div>
+          ) : (
+            <div className="px-4 pb-4 text-[12px] text-editor-muted">No effects on this layer</div>
+          )}
+        </section>
+        <section className="border-b panel-divider">
           <div className="flex h-10 items-center gap-2 px-4 text-[13px] font-semibold text-editor-ink">
             <ChevronDown size={15} /> Masks
           </div>
