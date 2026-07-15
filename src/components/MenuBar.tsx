@@ -397,7 +397,7 @@ export function MenuBar() {
 
   return (
     <>
-      <nav className="relative z-30 flex h-8 shrink-0 items-center overflow-x-auto border-b border-[#2e2e2e] bg-[#444] px-3 text-[13px] text-[#e7e7e7]">
+      <nav className="relative z-30 flex h-8 shrink-0 items-center overflow-visible border-b border-[#2e2e2e] bg-[#444] px-3 text-[13px] text-[#e7e7e7]">
         <input
           ref={imageInputRef}
           className="hidden"
@@ -440,7 +440,7 @@ export function MenuBar() {
               {menu}
             </button>
             {openMenu === menu ? (
-              <div className="absolute left-0 top-8 min-w-52 border border-editor-line bg-editor-panel shadow-2xl">
+              <div className="absolute left-0 top-8 z-50 min-w-52 border border-editor-line bg-editor-panel shadow-2xl">
                 {menus[menu].map((item) => <MenuButton key={item.label} item={item} close={close} />)}
               </div>
             ) : null}
