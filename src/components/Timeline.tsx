@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronRight, Copy, Gauge, LocateFixed, Maximize2, Scissors, Trash2 } from "lucide-react";
+import { ChevronDown, ChevronRight, Clock3, Copy, Gauge, LocateFixed, Maximize2, Scissors, Trash2 } from "lucide-react";
 import { useMemo, useRef, useState } from "react";
 import { propertyLabel } from "../lib/animation";
 import { effectControlDefinition, effectDefinition, isEffectNumberControl } from "../lib/effects";
@@ -89,6 +89,7 @@ export function Timeline({ mobile = false }: TimelineProps) {
   const setTimelineZoom = useEditorStore((state) => state.setTimelineZoom);
   const setPlayheadFrame = useEditorStore((state) => state.setPlayheadFrame);
   const setLayerTiming = useEditorStore((state) => state.setLayerTiming);
+  const updateActiveCompositionSettings = useEditorStore((state) => state.updateActiveCompositionSettings);
   const moveLayerTiming = useEditorStore((state) => state.moveLayerTiming);
   const selectLayer = useEditorStore((state) => state.selectLayer);
   const selectProperty = useEditorStore((state) => state.selectProperty);
@@ -147,6 +148,11 @@ export function Timeline({ mobile = false }: TimelineProps) {
     const layer = composition.layers.find((candidate) => candidate.id === layerId);
     return Boolean(layer && !layer.locked && playheadFrame > layer.startFrame && playheadFrame < layer.endFrame);
   });
+  const canTrimCompositionToPlayhead = playheadFrame > 0 && playheadFrame < durationFrames - 1;
+  const trimCompositionToPlayhead = () => {
+    if (!canTrimCompositionToPlayhead) return;
+    updateActiveCompositionSettings({ durationFrames: Math.max(1, playheadFrame) });
+  };
 
   const fitTimeline = () => {
     const scroller = timelineScrollRef.current;
@@ -187,6 +193,7 @@ export function Timeline({ mobile = false }: TimelineProps) {
           <span className="text-[12px] font-semibold uppercase text-editor-muted">Timeline</span>
           <button className="icon-button h-7 w-7" title="Copy keyframes" onClick={copySelection}><Copy size={13} /></button>
           <button className="icon-button h-7 w-7" title="Split selected layer at playhead" disabled={!canSplitLayer} onClick={splitSelectedLayers}><Scissors size={13} /></button>
+          <button className="icon-button h-7 w-7" title="Trim composition to playhead" disabled={!canTrimCompositionToPlayhead} onClick={trimCompositionToPlayhead}><Clock3 size={13} /></button>
           <button className="icon-button h-7 w-7" title="Delete selection" onClick={deleteSelection}><Trash2 size={13} /></button>
           <button className={`icon-button h-7 w-7 ${graphMode === "speed" ? "icon-button-active" : ""}`} title="Speed graph" onClick={() => setGraphMode(graphMode === "speed" ? "value" : "speed")}><Gauge size={13} /></button>
         </div>
