@@ -1854,6 +1854,21 @@ export const useEditorStore = create<EditorState>()(
               selectedKeyframeIds: [],
             };
           }
+          if (state.selectedMaskId) {
+            const selectedMaskId = state.selectedMaskId;
+            return {
+              project: updateActiveComposition(state, (layers) =>
+                layers.map((layer) =>
+                  layer.masks.some((mask) => mask.id === selectedMaskId)
+                    ? { ...layer, masks: layer.masks.filter((mask) => mask.id !== selectedMaskId) }
+                    : layer,
+                ),
+              ),
+              selectedKeyframeIds: [],
+              selectedMaskId: undefined,
+              selectedMaskProperty: undefined,
+            };
+          }
           const layerIds = new Set(state.selectedLayerIds);
           return {
             project: updateActiveComposition(state, (layers) => layers.filter((layer) => !layerIds.has(layer.id))),

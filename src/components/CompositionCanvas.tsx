@@ -851,7 +851,7 @@ function applyLayerEffects(source: HTMLCanvasElement, layer: Layer, frame: numbe
   return layer.effects.reduce((canvas, effect) => applyEffectCanvas(canvas, effect, frame), source);
 }
 
-function applyAdjustmentLayerToCanvas(canvas: HTMLCanvasElement, layer: Layer, frame: number) {
+function applyAdjustmentLayerToCanvas(canvas: HTMLCanvasElement, composition: Composition, layer: Layer, frame: number) {
   if (layer.effects.length === 0) return;
 
   const context = canvas.getContext("2d");
@@ -859,7 +859,8 @@ function applyAdjustmentLayerToCanvas(canvas: HTMLCanvasElement, layer: Layer, f
 
   const processed = applyLayerEffects(canvas, layer, frame);
   const opacity = clampUnit(evaluateProperty(layer.transform.opacity, frame) / 100);
-  const output = opacity < 0.999 ? blendCanvas(canvas, processed, opacity) : processed;
+  const adjusted = opacity < 0.999 ? blendCanvas(canvas, processed, opacity) : processed;
+  const output = applyAdjustmentLayerMask(canvas, adjusted, composition, layer, frame);
   context.clearRect(0, 0, canvas.width, canvas.height);
   context.drawImage(output, 0, 0, canvas.width, canvas.height);
 }
@@ -888,6 +889,63 @@ function drawPolygonPath(context: CanvasRenderingContext2D, points: MaskPath, cl
   context.moveTo(points[0][0], points[0][1]);
   points.slice(1).forEach((point) => context.lineTo(point[0], point[1]));
   if (closePath && points.length > 2) context.closePath();
+}
+
+function applyAdjustmentLayerMask(
+  original: HTMLCanvasElement,
+  adjusted: HTMLCanvasElement,
+  composition: Composition,
+  layer: Layer,
+  frame: number,
+) {
+  if (layer.masks.length === 0) return adjusted;
+
+  const width = original.width;
+  const height = original.height;
+  const maskCanvas = document.createElement("canvas");
+  maskCanvas.width = width;
+  maskCanvas.height = height;
+  const maskContext = maskCanvas.getContext("2d");
+  if (!maskContext) return adjusted;
+
+  layer.masks.forEach((mask) => {
+    const points = evaluatedMaskPoints(mask, frame).map((point) => layerPointToComposition(composition, layer, frame, point));
+    if (points.length < 3) return;
+
+    const feather = Math.max(0, evaluateProperty(mask.feather, frame));
+    maskContext.save();
+    if (feather > 0) maskContext.filter = `blur(${feather}px)`;
+
+    if (mask.inverted) {
+      maskContext.fillStyle = "#fff";
+      maskContext.fillRect(0, 0, width, height);
+      maskContext.globalCompositeOperation = "destination-out";
+    }
+
+    maskContext.fillStyle = "#fff";
+    drawPolygonPath(maskContext, points);
+    maskContext.fill();
+    maskContext.restore();
+  });
+
+  const maskedAdjusted = document.createElement("canvas");
+  maskedAdjusted.width = width;
+  maskedAdjusted.height = height;
+  const maskedContext = maskedAdjusted.getContext("2d");
+  if (!maskedContext) return adjusted;
+  maskedContext.drawImage(adjusted, 0, 0, width, height);
+  maskedContext.globalCompositeOperation = "destination-in";
+  maskedContext.drawImage(maskCanvas, 0, 0);
+  maskedContext.globalCompositeOperation = "source-over";
+
+  const output = document.createElement("canvas");
+  output.width = width;
+  output.height = height;
+  const outputContext = output.getContext("2d");
+  if (!outputContext) return adjusted;
+  outputContext.drawImage(original, 0, 0, width, height);
+  outputContext.drawImage(maskedAdjusted, 0, 0, width, height);
+  return output;
 }
 
 function drawMaskedLayerContent(
@@ -994,19 +1052,28 @@ function drawLayerOverlay(
   context.restore();
 }
 
-function drawAdjustmentLayerOverlay(context: CanvasRenderingContext2D, composition: Composition) {
+function drawAdjustmentLayerOverlay(
+  context: CanvasRenderingContext2D,
+  composition: Composition,
+  layer: Layer,
+  frame: number,
+  selectedMaskId?: string,
+) {
+  const [width, height] = getLayerSize(layer);
   context.save();
+  applyLayerTransform(context, composition, layer, frame);
   context.globalAlpha = 1;
   context.lineWidth = 3;
   context.strokeStyle = "#f2b84b";
   context.setLineDash([14, 8]);
-  context.strokeRect(0, 0, composition.width, composition.height);
+  context.strokeRect(0, 0, width, height);
   context.setLineDash([]);
   context.fillStyle = "#f2b84b";
   const handle = 16;
-  [[0, 0], [composition.width, 0], [composition.width, composition.height], [0, composition.height]].forEach(([x, y]) => {
+  [[0, 0], [width, 0], [width, height], [0, height]].forEach(([x, y]) => {
     context.fillRect(x - handle / 2, y - handle / 2, handle, handle);
   });
+  drawMaskOutlines(context, layer, frame, selectedMaskId);
   context.restore();
 }
 
@@ -1141,7 +1208,7 @@ function renderCompositionFrame(
   if (contentContext) {
     drawableLayers.forEach((layer) => {
       if (layer.type === "adjustment") {
-        applyAdjustmentLayerToCanvas(contentCanvas, layer, frame);
+        applyAdjustmentLayerToCanvas(contentCanvas, composition, layer, frame);
         return;
       }
       drawLayer(contentContext, composition, layer, frame, options.images, options.videos, false, options.selectedMaskId, options.liveVideoPlayback);
@@ -1157,7 +1224,7 @@ function renderCompositionFrame(
     drawableLayers
       .filter((layer) => selectedLayerIds.includes(layer.id))
       .forEach((layer) => {
-        if (layer.type === "adjustment") drawAdjustmentLayerOverlay(context, composition);
+        if (layer.type === "adjustment") drawAdjustmentLayerOverlay(context, composition, layer, frame, options.selectedMaskId);
         else drawLayerOverlay(context, composition, layer, frame, options.selectedMaskId);
       });
 
@@ -1850,7 +1917,7 @@ export function CompositionCanvas() {
 
           if (activeTool === "mask") {
             event.preventDefault();
-            const selectedLayer = composition.layers.find((layer) => layer.id === selectedLayerIds[0] && !layer.locked && layer.type !== "null" && layer.type !== "audio" && layer.type !== "adjustment" && layer.type !== "model");
+            const selectedLayer = composition.layers.find((layer) => layer.id === selectedLayerIds[0] && !layer.locked && layer.type !== "null" && layer.type !== "audio" && layer.type !== "model");
             const targetLayer = selectedLayer ?? hit;
             if (!targetLayer) return;
             if (!selectedLayerIds.includes(targetLayer.id)) selectLayer(targetLayer.id);
