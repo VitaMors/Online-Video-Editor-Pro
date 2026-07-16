@@ -108,6 +108,7 @@ type EditorState = {
   freezeTimeRemap: (layerId: string) => void;
   reverseTimeRemap: (layerId: string) => void;
   setLayerTiming: (layerId: string, startFrame: number, endFrame: number) => void;
+  moveLayerTiming: (layerId: string, startFrame: number) => void;
   splitSelectedLayers: () => void;
   selectLayer: (layerId: string, additive?: boolean) => void;
   selectProperty: (property: TransformPropertyKey) => void;
@@ -1326,7 +1327,30 @@ export const useEditorStore = create<EditorState>()(
             }),
           };
         }),
-      splitSelectedLayers: () =>
+      moveLayerTiming: (layerId, startFrame) =>
+        set((state) => {
+          const composition = activeComposition(state);
+          const layer = composition?.layers.find((candidate) => candidate.id === layerId);
+          if (!composition || !layer || layer.locked) return {};
+
+          const durationFrames = Math.max(1, Math.round(finiteNumber(composition.durationFrames, 300)));
+          const currentStart = Math.max(0, Math.round(finiteNumber(layer.startFrame, 0)));
+          const currentEnd = Math.min(durationFrames, Math.max(currentStart + 1, Math.round(finiteNumber(layer.endFrame, durationFrames))));
+          const layerDuration = Math.max(1, currentEnd - currentStart);
+          const maxStart = Math.max(0, durationFrames - layerDuration);
+          const nextStart = Math.min(maxStart, Math.max(0, Math.round(finiteNumber(startFrame, currentStart))));
+          const nextEnd = Math.min(durationFrames, nextStart + layerDuration);
+
+          if (nextStart === currentStart && nextEnd === currentEnd) return {};
+
+          return {
+            project: updateLayer(state, layerId, (currentLayer) => ({
+              ...currentLayer,
+              startFrame: nextStart,
+              endFrame: nextEnd,
+            })),
+          };
+        }),      splitSelectedLayers: () =>
         set((state) => {
           const composition = activeComposition(state);
           if (!composition || state.selectedLayerIds.length === 0) return {};

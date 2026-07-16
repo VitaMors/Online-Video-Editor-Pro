@@ -24,6 +24,7 @@ type TimelineRow =
 type Dragging =
   | "playhead"
   | { type: "layerTrim"; layerId: string; edge: "in" | "out" }
+  | { type: "layerMove"; layerId: string; startPointerFrame: number; startFrame: number; endFrame: number }
   | { type: "timeRemap"; layerId: string; keyframeId: string }
   | { type: "effect"; layerId: string; effectId: string; property: EffectPropertyKey; keyframeId: string }
   | { type: "transform"; layerId: string; property: TransformPropertyKey; keyframeId: string }
@@ -88,6 +89,7 @@ export function Timeline({ mobile = false }: TimelineProps) {
   const setTimelineZoom = useEditorStore((state) => state.setTimelineZoom);
   const setPlayheadFrame = useEditorStore((state) => state.setPlayheadFrame);
   const setLayerTiming = useEditorStore((state) => state.setLayerTiming);
+  const moveLayerTiming = useEditorStore((state) => state.moveLayerTiming);
   const selectLayer = useEditorStore((state) => state.selectLayer);
   const selectProperty = useEditorStore((state) => state.selectProperty);
   const selectMask = useEditorStore((state) => state.selectMask);
@@ -227,13 +229,18 @@ export function Timeline({ mobile = false }: TimelineProps) {
             onPointerDown={(event) => { event.preventDefault(); setDragging("playhead"); setPlayheadFrame(frameFromPointer(event, frameWidth, durationFrames)); event.currentTarget.setPointerCapture(event.pointerId); }}
             onPointerMove={(event) => {
               if (!dragging) return;
-              const frame = frameFromPointer(event, frameWidth, durationFrames, dragging !== "playhead" && dragging.type === "layerTrim");
+              const allowEndFrame = dragging !== "playhead" && (dragging.type === "layerTrim" || dragging.type === "layerMove");
+              const frame = frameFromPointer(event, frameWidth, durationFrames, allowEndFrame);
               if (dragging === "playhead") setPlayheadFrame(frame);
               else if (dragging.type === "layerTrim") {
                 const layer = composition.layers.find((candidate) => candidate.id === dragging.layerId);
                 if (!layer) return;
                 if (dragging.edge === "in") setLayerTiming(layer.id, Math.min(frame, layer.endFrame - 1), layer.endFrame);
                 else setLayerTiming(layer.id, layer.startFrame, Math.max(frame, layer.startFrame + 1));
+              }
+              else if (dragging.type === "layerMove") {
+                const delta = frame - dragging.startPointerFrame;
+                moveLayerTiming(dragging.layerId, dragging.startFrame + delta);
               }
               else if (dragging.type === "timeRemap") moveTimeRemapKeyframe(dragging.layerId, dragging.keyframeId, frame);
               else if (dragging.type === "effect") moveEffectKeyframe(dragging.layerId, dragging.effectId, dragging.property, dragging.keyframeId, frame);
@@ -274,7 +281,26 @@ export function Timeline({ mobile = false }: TimelineProps) {
 
                     return (
                       <g>
-                        <rect x={layerStartX} y={y + 7} width={layerWidth} height={14} fill={row.layer.locked ? "#596579" : "#293241"} stroke="#596579" rx={3} />
+                        <rect
+                          x={layerStartX}
+                          y={y + 7}
+                          width={layerWidth}
+                          height={14}
+                          fill={row.layer.locked ? "#596579" : "#293241"}
+                          stroke="#596579"
+                          rx={3}
+                          cursor={row.layer.locked ? "default" : "grab"}
+                          onPointerDown={(event) => {
+                            if (row.layer.locked) return;
+                            event.preventDefault();
+                            event.stopPropagation();
+                            selectLayer(row.layer.id);
+                            const svg = event.currentTarget.ownerSVGElement;
+                            const startPointerFrame = svg ? frameFromSvgPoint(svg, event.clientX, frameWidth, durationFrames, true) : row.layer.startFrame;
+                            setDragging({ type: "layerMove", layerId: row.layer.id, startPointerFrame, startFrame: row.layer.startFrame, endFrame: row.layer.endFrame });
+                            svg?.setPointerCapture(event.pointerId);
+                          }}
+                        />
                         <rect
                           x={layerStartX}
                           y={y + 5}
