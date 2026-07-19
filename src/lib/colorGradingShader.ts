@@ -255,7 +255,7 @@ void main() {
   }
 
   vec3 gradedRaw = applyGrade(source.rgb);
-  vec3 mixedRaw = mix(decodeInput(source.rgb), gradedRaw, u_mix);
+  vec3 mixedRaw = mix(gradedRaw, decodeInput(source.rgb), u_mix);
   vec3 mixed = clamp(mixedRaw, 0.0, 1.0);
 
   if (u_clippingWarning == 1) {
@@ -371,9 +371,9 @@ function curveValues(effect: Effect, prefix: string, frame: number): [number, nu
 }
 
 export function applyColorGradingShader(source: HTMLCanvasElement, effect: Effect, frame: number) {
-  const mix = numberValue(effect, "mix", frame) / 100;
+  const mix = Math.max(0, Math.min(1, numberValue(effect, "mix", frame) / 100));
   const scopeMode = Math.round(numberValue(effect, "scopeMode", frame));
-  if (mix <= 0 && scopeMode === 0) return source;
+  if (mix >= 0.999 && scopeMode === 0) return source;
 
   const current = shaderRuntime();
   if (!current) return source;
@@ -396,7 +396,7 @@ export function applyColorGradingShader(source: HTMLCanvasElement, effect: Effec
   setInt(gl, uniforms, "u_image", 0);
   const resolutionLocation = uniforms.u_resolution;
   if (resolutionLocation) gl.uniform2f(resolutionLocation, canvas.width, canvas.height);
-  setFloat(gl, uniforms, "u_mix", Math.max(0, Math.min(1, mix)));
+  setFloat(gl, uniforms, "u_mix", mix);
   setFloat(gl, uniforms, "u_temperature", numberValue(effect, "temperature", frame));
   setFloat(gl, uniforms, "u_tint", numberValue(effect, "tint", frame));
   setFloat(gl, uniforms, "u_exposure", numberValue(effect, "exposure", frame));

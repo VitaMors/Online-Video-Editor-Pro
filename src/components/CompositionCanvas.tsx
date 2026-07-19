@@ -3,7 +3,7 @@ import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { evaluatePathProperty, evaluateProperty, getLayerSize, getWorldPosition } from "../lib/animation";
 import { applyColorGradingShader } from "../lib/colorGradingShader";
-import { effectNumberValue, effectStaticValue } from "../lib/effects";
+import { effectNumberValue, effectStaticValue, isEffectNumberControl } from "../lib/effects";
 import { useEditorStore } from "../store/editorStore";
 import type { Composition, Effect, Layer, Mask, MaskPath, SpatialVector, Vector2 } from "../types/editor";
 
@@ -562,6 +562,56 @@ function colorFromHex(value: unknown): [number, number, number] {
   ];
 }
 
+function hueToRgb(p: number, q: number, t: number) {
+  let hue = t;
+  if (hue < 0) hue += 1;
+  if (hue > 1) hue -= 1;
+  if (hue < 1 / 6) return p + (q - p) * 6 * hue;
+  if (hue < 1 / 2) return q;
+  if (hue < 2 / 3) return p + (q - p) * (2 / 3 - hue) * 6;
+  return p;
+}
+
+function rgbToHsl(r: number, g: number, b: number): [number, number, number] {
+  const red = r / 255;
+  const green = g / 255;
+  const blue = b / 255;
+  const max = Math.max(red, green, blue);
+  const min = Math.min(red, green, blue);
+  const lightness = (max + min) / 2;
+  const delta = max - min;
+
+  if (delta <= 0.00001) return [0, 0, lightness];
+
+  const saturation = delta / (1 - Math.abs(2 * lightness - 1));
+  let hue = 0;
+  if (max === red) hue = ((green - blue) / delta) % 6;
+  else if (max === green) hue = (blue - red) / delta + 2;
+  else hue = (red - green) / delta + 4;
+  hue /= 6;
+  if (hue < 0) hue += 1;
+
+  return [hue, saturation, lightness];
+}
+
+function hslToRgb(hsl: [number, number, number]): [number, number, number] {
+  const hue = ((hsl[0] % 1) + 1) % 1;
+  const saturation = clampUnit(hsl[1]);
+  const lightness = clampUnit(hsl[2]);
+  if (saturation <= 0.00001) {
+    const value = clampByte(lightness * 255);
+    return [value, value, value];
+  }
+
+  const q = lightness < 0.5 ? lightness * (1 + saturation) : lightness + saturation - lightness * saturation;
+  const p = 2 * lightness - q;
+  return [
+    clampByte(hueToRgb(p, q, hue + 1 / 3) * 255),
+    clampByte(hueToRgb(p, q, hue) * 255),
+    clampByte(hueToRgb(p, q, hue - 1 / 3) * 255),
+  ];
+}
+
 function canvasLike(source: HTMLCanvasElement) {
   const canvas = document.createElement("canvas");
   canvas.width = source.width;
@@ -591,6 +641,24 @@ function blendCanvas(original: HTMLCanvasElement, processed: HTMLCanvasElement, 
   return canvas;
 }
 
+function mixWithOriginalAmount(effect: Effect, frame: number) {
+  return clampUnit(effectNumberValue(effect, "mix", frame) / 100);
+}
+
+function blendWithOriginal(original: HTMLCanvasElement, processed: HTMLCanvasElement, amount: number) {
+  const originalAmount = clampUnit(amount);
+  if (originalAmount <= 0.001) return processed;
+  if (originalAmount >= 0.999) return original;
+  const canvas = canvasLike(original);
+  const context = canvas.getContext("2d");
+  if (!context) return processed;
+  context.drawImage(processed, 0, 0);
+  context.globalAlpha = originalAmount;
+  context.drawImage(original, 0, 0);
+  context.globalAlpha = 1;
+  return canvas;
+}
+
 function imageDataCanvas(source: HTMLCanvasElement, mutator: (data: Uint8ClampedArray) => void) {
   const canvas = canvasLike(source);
   const context = canvas.getContext("2d", { willReadFrequently: true });
@@ -603,15 +671,57 @@ function imageDataCanvas(source: HTMLCanvasElement, mutator: (data: Uint8Clamped
 }
 
 function cssFilterEffect(source: HTMLCanvasElement, effect: Effect, frame: number, filter: string) {
-  const mix = effectNumberValue(effect, "mix", frame) / 100;
-  if (mix <= 0) return source;
-  return blendCanvas(source, filteredCanvas(source, filter), mix);
+  const mix = mixWithOriginalAmount(effect, frame);
+  if (mix >= 0.999) return source;
+  return blendWithOriginal(source, filteredCanvas(source, filter), mix);
+}
+
+function hueSaturationCanvas(source: HTMLCanvasElement, effect: Effect, frame: number) {
+  const mix = mixWithOriginalAmount(effect, frame);
+  if (mix >= 0.999) return source;
+  const hueShift = effectNumberValue(effect, "hue", frame) / 360;
+  const saturationScale = Math.max(0, 1 + effectNumberValue(effect, "saturation", frame) / 100);
+  const lightnessShift = effectNumberValue(effect, "lightness", frame) / 100;
+
+  return blendWithOriginal(source, imageDataCanvas(source, (data) => {
+    for (let index = 0; index < data.length; index += 4) {
+      const hsl = rgbToHsl(data[index], data[index + 1], data[index + 2]);
+      hsl[0] = ((hsl[0] + hueShift) % 1 + 1) % 1;
+      hsl[1] = clampUnit(hsl[1] * saturationScale);
+      hsl[2] = clampUnit(hsl[2] + lightnessShift);
+      const [r, g, b] = hslToRgb(hsl);
+      data[index] = r;
+      data[index + 1] = g;
+      data[index + 2] = b;
+    }
+  }), mix);
+}
+
+function booleanEffectValue(effect: Effect, key: string, fallback = false) {
+  const value = effectStaticValue(effect, key);
+  return typeof value === "boolean" ? value : fallback;
+}
+
+function numericEffectValue(effect: Effect, key: string, frame: number, fallback: number) {
+  const control = effect.controls[key];
+  return isEffectNumberControl(control) ? effectNumberValue(effect, key, frame) : fallback;
+}
+
+function glowSpreadPadding(layer: Layer, frame: number) {
+  return layer.effects.reduce((padding, effect) => {
+    if (effect.enabled === false || effect.type !== "glow") return padding;
+    const radius = Math.max(0, numericEffectValue(effect, "radius", frame, 20));
+    const intensity = Math.max(0, numericEffectValue(effect, "intensity", frame, 100));
+    const mix = mixWithOriginalAmount(effect, frame);
+    if (radius <= 0 || intensity <= 0 || mix >= 0.999) return padding;
+    return Math.max(padding, Math.ceil(radius * 2.5));
+  }, 0);
 }
 
 function directionalBlurCanvas(source: HTMLCanvasElement, effect: Effect, frame: number) {
-  const mix = effectNumberValue(effect, "mix", frame) / 100;
+  const mix = mixWithOriginalAmount(effect, frame);
   const distance = Math.max(0, effectNumberValue(effect, "distance", frame));
-  if (mix <= 0 || distance <= 0) return source;
+  if (mix >= 0.999 || distance <= 0) return source;
   const angle = (effectNumberValue(effect, "angle", frame) * Math.PI) / 180;
   const steps = Math.max(3, Math.min(25, Math.ceil(distance / 6)));
   const canvas = canvasLike(source);
@@ -624,15 +734,15 @@ function directionalBlurCanvas(source: HTMLCanvasElement, effect: Effect, frame:
     context.drawImage(source, Math.cos(angle) * distance * t, Math.sin(angle) * distance * t);
   }
   context.globalAlpha = 1;
-  return blendCanvas(source, canvas, mix);
+  return blendWithOriginal(source, canvas, mix);
 }
 
 function fillCanvas(source: HTMLCanvasElement, effect: Effect, frame: number) {
-  const mix = effectNumberValue(effect, "mix", frame) / 100;
+  const mix = mixWithOriginalAmount(effect, frame);
   const opacity = effectNumberValue(effect, "opacity", frame) / 100;
-  if (mix <= 0 || opacity <= 0) return source;
+  if (mix >= 0.999 || opacity <= 0) return source;
   const [r, g, b] = colorFromHex(effectStaticValue(effect, "color"));
-  return blendCanvas(source, imageDataCanvas(source, (data) => {
+  return blendWithOriginal(source, imageDataCanvas(source, (data) => {
     for (let index = 0; index < data.length; index += 4) {
       data[index] = r;
       data[index + 1] = g;
@@ -643,12 +753,12 @@ function fillCanvas(source: HTMLCanvasElement, effect: Effect, frame: number) {
 }
 
 function tintCanvas(source: HTMLCanvasElement, effect: Effect, frame: number) {
-  const mix = effectNumberValue(effect, "mix", frame) / 100;
+  const mix = mixWithOriginalAmount(effect, frame);
   const amount = effectNumberValue(effect, "amount", frame) / 100;
-  if (mix <= 0 || amount <= 0) return source;
+  if (mix >= 0.999 || amount <= 0) return source;
   const black = colorFromHex(effectStaticValue(effect, "blackColor"));
   const white = colorFromHex(effectStaticValue(effect, "whiteColor"));
-  return blendCanvas(source, imageDataCanvas(source, (data) => {
+  return blendWithOriginal(source, imageDataCanvas(source, (data) => {
     for (let index = 0; index < data.length; index += 4) {
       const luminance = (data[index] * 0.2126 + data[index + 1] * 0.7152 + data[index + 2] * 0.0722) / 255;
       const target = [
@@ -664,14 +774,14 @@ function tintCanvas(source: HTMLCanvasElement, effect: Effect, frame: number) {
 }
 
 function levelsCanvas(source: HTMLCanvasElement, effect: Effect, frame: number) {
-  const mix = effectNumberValue(effect, "mix", frame) / 100;
-  if (mix <= 0) return source;
+  const mix = mixWithOriginalAmount(effect, frame);
+  if (mix >= 0.999) return source;
   const blackInput = effectNumberValue(effect, "blackInput", frame);
   const whiteInput = Math.max(blackInput + 1, effectNumberValue(effect, "whiteInput", frame));
   const gamma = Math.max(0.1, effectNumberValue(effect, "gamma", frame));
   const outputBlack = effectNumberValue(effect, "outputBlack", frame);
   const outputWhite = effectNumberValue(effect, "outputWhite", frame);
-  return blendCanvas(source, imageDataCanvas(source, (data) => {
+  return blendWithOriginal(source, imageDataCanvas(source, (data) => {
     for (let index = 0; index < data.length; index += 4) {
       for (let channel = 0; channel < 3; channel += 1) {
         const normalized = clampUnit((data[index + channel] - blackInput) / (whiteInput - blackInput));
@@ -682,12 +792,12 @@ function levelsCanvas(source: HTMLCanvasElement, effect: Effect, frame: number) 
 }
 
 function curvesCanvas(source: HTMLCanvasElement, effect: Effect, frame: number) {
-  const mix = effectNumberValue(effect, "mix", frame) / 100;
-  if (mix <= 0) return source;
+  const mix = mixWithOriginalAmount(effect, frame);
+  if (mix >= 0.999) return source;
   const shadows = effectNumberValue(effect, "shadows", frame);
   const midtones = effectNumberValue(effect, "midtones", frame);
   const highlights = effectNumberValue(effect, "highlights", frame);
-  return blendCanvas(source, imageDataCanvas(source, (data) => {
+  return blendWithOriginal(source, imageDataCanvas(source, (data) => {
     for (let index = 0; index < data.length; index += 4) {
       const lum = (data[index] * 0.2126 + data[index + 1] * 0.7152 + data[index + 2] * 0.0722) / 255;
       const delta = shadows * (1 - lum) ** 2 + midtones * Math.max(0, 1 - Math.abs(lum - 0.5) * 2) + highlights * lum ** 2;
@@ -699,12 +809,12 @@ function curvesCanvas(source: HTMLCanvasElement, effect: Effect, frame: number) 
 }
 
 function exposureCanvas(source: HTMLCanvasElement, effect: Effect, frame: number) {
-  const mix = effectNumberValue(effect, "mix", frame) / 100;
-  if (mix <= 0) return source;
+  const mix = mixWithOriginalAmount(effect, frame);
+  if (mix >= 0.999) return source;
   const exposure = 2 ** effectNumberValue(effect, "exposure", frame);
   const offset = effectNumberValue(effect, "offset", frame);
   const gamma = Math.max(0.1, effectNumberValue(effect, "gamma", frame));
-  return blendCanvas(source, imageDataCanvas(source, (data) => {
+  return blendWithOriginal(source, imageDataCanvas(source, (data) => {
     for (let index = 0; index < data.length; index += 4) {
       for (let channel = 0; channel < 3; channel += 1) {
         const normalized = clampUnit(data[index + channel] / 255 * exposure + offset);
@@ -715,42 +825,83 @@ function exposureCanvas(source: HTMLCanvasElement, effect: Effect, frame: number
 }
 
 function glowCanvas(source: HTMLCanvasElement, effect: Effect, frame: number) {
-  const mix = effectNumberValue(effect, "mix", frame) / 100;
-  const radius = effectNumberValue(effect, "radius", frame);
-  const intensity = effectNumberValue(effect, "intensity", frame) / 100;
-  if (mix <= 0 || radius <= 0 || intensity <= 0) return source;
-  const threshold = effectNumberValue(effect, "threshold", frame) / 100;
-  const [r, g, b] = colorFromHex(effectStaticValue(effect, "color"));
+  const mix = mixWithOriginalAmount(effect, frame);
+  const radius = Math.max(0, numericEffectValue(effect, "radius", frame, 20));
+  const intensity = Math.max(0, numericEffectValue(effect, "intensity", frame, 100)) / 100;
+  if (mix >= 0.999 || radius <= 0 || intensity <= 0) return source;
+
+  const threshold = clampUnit(numericEffectValue(effect, "threshold", frame, 60) / 100);
+  const compositeOriginal = Math.max(0, Math.min(2, Math.round(numericEffectValue(effect, "compositeOriginal", frame, 0))));
+  const basedOnAlpha = booleanEffectValue(effect, "basedOnAlpha", false);
+  const useSourceColors = booleanEffectValue(effect, "useSourceColors", true);
+  const glowColor = colorFromHex(effectStaticValue(effect, "color"));
+  const thresholdRange = Math.max(0.001, 1 - threshold);
+
   const glowSource = imageDataCanvas(source, (data) => {
     for (let index = 0; index < data.length; index += 4) {
+      const alpha = data[index + 3] / 255;
       const luminance = (data[index] * 0.2126 + data[index + 1] * 0.7152 + data[index + 2] * 0.0722) / 255;
-      if (luminance < threshold) data[index + 3] = 0;
+      const rawWeight = basedOnAlpha ? alpha : (luminance - threshold) / thresholdRange;
+      const weight = clampUnit(rawWeight) ** 0.75;
+
+      if (useSourceColors) {
+        data[index] = clampByte(data[index]);
+        data[index + 1] = clampByte(data[index + 1]);
+        data[index + 2] = clampByte(data[index + 2]);
+      } else {
+        data[index] = glowColor[0];
+        data[index + 1] = glowColor[1];
+        data[index + 2] = glowColor[2];
+      }
+      data[index + 3] = clampByte(alpha * weight * 255);
     }
   });
-  const glow = filteredCanvas(glowSource, `blur(${radius}px)`);
-  const tint = canvasLike(source);
-  const tintContext = tint.getContext("2d");
-  if (!tintContext) return source;
-  tintContext.drawImage(glow, 0, 0);
-  tintContext.globalCompositeOperation = "source-in";
-  tintContext.fillStyle = `rgb(${r}, ${g}, ${b})`;
-  tintContext.fillRect(0, 0, tint.width, tint.height);
-  tintContext.globalCompositeOperation = "source-over";
-  const canvas = canvasLike(source);
-  const context = canvas.getContext("2d");
+
+  const wideGlow = filteredCanvas(glowSource, `blur(${radius}px)`);
+  const tightGlow = filteredCanvas(glowSource, `blur(${Math.max(0.25, radius * 0.35)}px)`);
+  const glow = canvasLike(source);
+  const glowContext = glow.getContext("2d");
+  if (!glowContext) return source;
+  glowContext.globalCompositeOperation = "lighter";
+  glowContext.globalAlpha = 0.85;
+  glowContext.drawImage(wideGlow, 0, 0);
+  glowContext.globalAlpha = 0.45;
+  glowContext.drawImage(tightGlow, 0, 0);
+  glowContext.globalAlpha = 0.18;
+  glowContext.drawImage(glowSource, 0, 0);
+  glowContext.globalAlpha = 1;
+  glowContext.globalCompositeOperation = "source-over";
+
+  const output = canvasLike(source);
+  const context = output.getContext("2d");
   if (!context) return source;
-  context.drawImage(source, 0, 0);
-  context.globalCompositeOperation = "lighter";
-  context.globalAlpha = intensity;
-  context.drawImage(tint, 0, 0);
-  context.globalCompositeOperation = "source-over";
-  context.globalAlpha = 1;
-  return blendCanvas(source, canvas, mix);
+
+  if (compositeOriginal === 1) {
+    context.globalCompositeOperation = "lighter";
+    context.globalAlpha = intensity;
+    context.drawImage(glow, 0, 0);
+    context.globalAlpha = 1;
+    context.globalCompositeOperation = "source-over";
+    context.drawImage(source, 0, 0);
+  } else if (compositeOriginal === 2) {
+    context.globalAlpha = intensity;
+    context.drawImage(glow, 0, 0);
+    context.globalAlpha = 1;
+  } else {
+    context.drawImage(source, 0, 0);
+    context.globalCompositeOperation = "lighter";
+    context.globalAlpha = intensity;
+    context.drawImage(glow, 0, 0);
+    context.globalAlpha = 1;
+    context.globalCompositeOperation = "source-over";
+  }
+
+  return blendWithOriginal(source, output, mix);
 }
 
 function dropShadowCanvas(source: HTMLCanvasElement, effect: Effect, frame: number) {
-  const mix = effectNumberValue(effect, "mix", frame) / 100;
-  if (mix <= 0) return source;
+  const mix = mixWithOriginalAmount(effect, frame);
+  if (mix >= 0.999) return source;
   const opacity = effectNumberValue(effect, "opacity", frame) / 100;
   const distance = effectNumberValue(effect, "distance", frame);
   const angle = (effectNumberValue(effect, "angle", frame) * Math.PI) / 180;
@@ -769,16 +920,16 @@ function dropShadowCanvas(source: HTMLCanvasElement, effect: Effect, frame: numb
   context.shadowOffsetX = 0;
   context.shadowOffsetY = 0;
   context.drawImage(source, 0, 0);
-  return blendCanvas(source, canvas, mix);
+  return blendWithOriginal(source, canvas, mix);
 }
 
 function noiseCanvas(source: HTMLCanvasElement, effect: Effect, frame: number) {
-  const mix = effectNumberValue(effect, "mix", frame) / 100;
+  const mix = mixWithOriginalAmount(effect, frame);
   const amount = effectNumberValue(effect, "amount", frame) * 1.28;
-  if (mix <= 0 || amount <= 0) return source;
+  if (mix >= 0.999 || amount <= 0) return source;
   const monochrome = Boolean(effectStaticValue(effect, "monochrome"));
   const seedFrame = Math.round(frame);
-  return blendCanvas(source, imageDataCanvas(source, (data) => {
+  return blendWithOriginal(source, imageDataCanvas(source, (data) => {
     for (let index = 0; index < data.length; index += 4) {
       const seed = (index * 9301 + seedFrame * 49297) % 233280;
       const noise = (seed / 233280 - 0.5) * amount;
@@ -796,9 +947,9 @@ function noiseCanvas(source: HTMLCanvasElement, effect: Effect, frame: number) {
 }
 
 function sharpenCanvas(source: HTMLCanvasElement, effect: Effect, frame: number) {
-  const mix = effectNumberValue(effect, "mix", frame) / 100;
+  const mix = mixWithOriginalAmount(effect, frame);
   const amount = effectNumberValue(effect, "amount", frame) / 100;
-  if (mix <= 0 || amount <= 0) return source;
+  if (mix >= 0.999 || amount <= 0) return source;
   const blurred = filteredCanvas(source, "blur(1px)");
   const canvas = canvasLike(source);
   const context = canvas.getContext("2d");
@@ -813,18 +964,13 @@ function sharpenCanvas(source: HTMLCanvasElement, effect: Effect, frame: number)
     sharp.data[index + 2] = clampByte(sharp.data[index + 2] + (sharp.data[index + 2] - soft.data[index + 2]) * amount);
   }
   context.putImageData(sharp, 0, 0);
-  return blendCanvas(source, canvas, mix);
+  return blendWithOriginal(source, canvas, mix);
 }
 
 function applyEffectCanvas(source: HTMLCanvasElement, effect: Effect, frame: number) {
   if (effect.enabled === false) return source;
   if (effect.type === "colorGrading") return applyColorGradingShader(source, effect, frame);
-  if (effect.type === "hueSaturation") {
-    const hue = effectNumberValue(effect, "hue", frame);
-    const saturation = Math.max(0, 100 + effectNumberValue(effect, "saturation", frame));
-    const lightness = Math.max(0, 100 + effectNumberValue(effect, "lightness", frame));
-    return cssFilterEffect(source, effect, frame, `hue-rotate(${hue}deg) saturate(${saturation}%) brightness(${lightness}%)`);
-  }
+  if (effect.type === "hueSaturation") return hueSaturationCanvas(source, effect, frame);
 
   if (effect.type === "brightnessContrast") {
     const brightness = Math.max(0, 100 + effectNumberValue(effect, "brightness", frame));
@@ -958,9 +1104,10 @@ function drawMaskedLayerContent(
   liveVideoPlayback: boolean,
 ) {
   const [width, height] = getLayerSize(layer);
+  const effectPadding = glowSpreadPadding(layer, frame);
   const contentCanvas = document.createElement("canvas");
-  contentCanvas.width = Math.max(1, Math.ceil(width));
-  contentCanvas.height = Math.max(1, Math.ceil(height));
+  contentCanvas.width = Math.max(1, Math.ceil(width + effectPadding * 2));
+  contentCanvas.height = Math.max(1, Math.ceil(height + effectPadding * 2));
   const contentContext = contentCanvas.getContext("2d");
 
   if (!contentContext) {
@@ -968,7 +1115,10 @@ function drawMaskedLayerContent(
     return;
   }
 
+  contentContext.save();
+  contentContext.translate(effectPadding, effectPadding);
   drawLayerContent(contentContext, layer, images, videos, frame, fps, liveVideoPlayback);
+  contentContext.restore();
 
   if (layer.masks.length > 0) {
     const maskCanvas = document.createElement("canvas");
@@ -977,7 +1127,7 @@ function drawMaskedLayerContent(
     const maskContext = maskCanvas.getContext("2d");
 
     if (!maskContext) {
-      context.drawImage(applyLayerEffects(contentCanvas, layer, frame), 0, 0, width, height);
+      context.drawImage(applyLayerEffects(contentCanvas, layer, frame), -effectPadding, -effectPadding);
       return;
     }
 
@@ -995,6 +1145,7 @@ function drawMaskedLayerContent(
         maskContext.globalCompositeOperation = "destination-out";
       }
 
+      maskContext.translate(effectPadding, effectPadding);
       maskContext.fillStyle = "#fff";
       drawPolygonPath(maskContext, points);
       maskContext.fill();
@@ -1006,9 +1157,8 @@ function drawMaskedLayerContent(
     contentContext.globalCompositeOperation = "source-over";
   }
 
-  context.drawImage(applyLayerEffects(contentCanvas, layer, frame), 0, 0, width, height);
+  context.drawImage(applyLayerEffects(contentCanvas, layer, frame), -effectPadding, -effectPadding);
 }
-
 function drawMaskOutlines(context: CanvasRenderingContext2D, layer: Layer, frame: number, selectedMaskId?: string) {
   layer.masks.forEach((mask) => {
     const points = evaluatedMaskPoints(mask, frame);

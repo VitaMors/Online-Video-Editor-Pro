@@ -499,6 +499,49 @@ function readAudioMetadata(url: string) {
     audio.load();
   });
 }
+
+function invertLegacyMixValue(value: unknown) {
+  const numeric = typeof value === "number" && Number.isFinite(value) ? value : 100;
+  return Math.min(100, Math.max(0, 100 - numeric));
+}
+
+function migrateEffectMixToBlendWithOriginal(project: Project): Project {
+  return {
+    ...project,
+    compositions: project.compositions.map((composition) => ({
+      ...composition,
+      layers: composition.layers.map((layer) => ({
+        ...layer,
+        effects: layer.effects.map((effect) => {
+          const mix = effect.controls.mix;
+          if (!isEffectNumberControl(mix)) return effect;
+          return {
+            ...effect,
+            controls: {
+              ...effect.controls,
+              mix: {
+                ...mix,
+                value: invertLegacyMixValue(mix.value),
+                keyframes: mix.keyframes.map((keyframe) => ({
+                  ...keyframe,
+                  value: invertLegacyMixValue(keyframe.value),
+                })),
+              },
+            },
+          };
+        }),
+      })),
+    })),
+  };
+}
+
+function migratePersistedState(persistedState: unknown, version: number) {
+  if (version >= 2 || typeof persistedState !== "object" || persistedState === null) return persistedState;
+  const state = persistedState as Partial<EditorState>;
+  if (!state.project) return persistedState;
+  return { ...state, project: migrateEffectMixToBlendWithOriginal(state.project) };
+}
+
 const defaultProject = createDefaultProject();
 let lastHistoryAt = 0;
 const historyMergeMs = 500;
@@ -1956,6 +1999,8 @@ export const useEditorStore = create<EditorState>()(
     },
     {
       name: "ovepro-foundation",
+      version: 2,
+      migrate: migratePersistedState,
       storage: createJSONStorage(() => localStorage),
       partialize: (state) => ({
         project: state.project,
