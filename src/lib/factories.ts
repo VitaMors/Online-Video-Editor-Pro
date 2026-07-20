@@ -72,6 +72,10 @@ function sourceForType(type: LayerType): LayerSource {
     return { width: 420, height: 420, depth: 420 };
   }
 
+  if (type === "camera") {
+    return { width: 220, height: 160, depth: 220, cameraFov: 35, cameraNear: 0.01, cameraFar: 1000 };
+  }
+
   if (type === "adjustment") {
     return { width: 1920, height: 1080 };
   }
@@ -87,6 +91,7 @@ function layerName(type: LayerType) {
     video: "Video Layer",
     audio: "Audio Layer",
     model: "3D Model Layer",
+    camera: "Camera Layer",
     solid: "Solid Layer",
     adjustment: "Adjustment Layer",
     null: "Null Layer",
@@ -108,8 +113,9 @@ export function createLayer(
   const width = source.width ?? 320;
   const height = source.height ?? 180;
   const depth = source.depth ?? Math.max(width, height);
-  const defaultPosition = (type === "model" ? [composition.width / 2, composition.height / 2, 0] : [composition.width / 2, composition.height / 2]) as SpatialVector;
-  const defaultSize = (type === "model" ? [width, height, depth] : [width, height]) as SpatialVector;
+  const is3DLayer = type === "model" || type === "camera";
+  const defaultPosition = (type === "camera" ? [composition.width / 2, composition.height / 2, -900] : is3DLayer ? [composition.width / 2, composition.height / 2, 0] : [composition.width / 2, composition.height / 2]) as SpatialVector;
+  const defaultSize = (is3DLayer ? [width, height, depth] : [width, height]) as SpatialVector;
 
   return {
     id: createId("layer"),

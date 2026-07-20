@@ -7,7 +7,7 @@ import type { Effect, EffectPropertyKey, Layer, Mask, MaskPropertyKey, Transform
 
 const labelWidth = 280;
 const transformRows: TransformPropertyKey[] = ["position", "scale", "rotation", "opacity"];
-const modelTransformRows: TransformPropertyKey[] = ["position", "scale", "rotationX", "rotationY", "rotation", "opacity"];
+const threeDTransformRows: TransformPropertyKey[] = ["position", "scale", "rotationX", "rotationY", "rotation", "opacity"];
 const maskRows: MaskPropertyKey[] = ["path", "feather", "position", "scale"];
 const rowHeight = 28;
 const rulerHeight = 30;
@@ -113,7 +113,7 @@ export function Timeline({ mobile = false }: TimelineProps) {
       const layerRow: TimelineRow = { kind: "layer", layer };
       if (!expanded) return [layerRow];
 
-      const currentTransformRows = layer.type === "model" ? modelTransformRows : transformRows;
+      const currentTransformRows = layer.type === "model" || layer.type === "camera" ? threeDTransformRows : transformRows;
       const transformPropertyRows = currentTransformRows.map<TimelineRow>((property) => ({ kind: "property", layer, property }));
       const timeRemapRows = layer.type === "video" && layer.source?.timeRemap
         ? [{ kind: "timeRemap", layer } satisfies TimelineRow]

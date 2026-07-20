@@ -242,7 +242,7 @@ export function MenuBar() {
 
   const selectedLayer = activeComposition?.layers.find((layer) => layer.id === selectedLayerIds[0]);
   const selectedVideoLayer = selectedLayer?.type === "video" ? selectedLayer : undefined;
-  const selectedEffectsLayer = selectedLayer && selectedLayer.type !== "audio" && selectedLayer.type !== "null" ? selectedLayer : undefined;
+  const selectedEffectsLayer = selectedLayer && selectedLayer.type !== "audio" && selectedLayer.type !== "null" && selectedLayer.type !== "camera" ? selectedLayer : undefined;
   const close = () => setOpenMenu(null);
   const createComposition = () => addComposition();
   const layerAction = (type: LayerType) => () => addLayer(type);
@@ -378,6 +378,7 @@ export function MenuBar() {
       { label: "New Solid Layer", action: layerAction("solid") },
       { label: "New Adjustment Layer", action: layerAction("adjustment") },
       { label: "New Null Layer", action: layerAction("null") },
+      { label: "New Camera Layer", action: layerAction("camera") },
       { label: "Split Layer", action: splitSelectedLayers },
       { label: selectedVideoLayer?.source?.timeRemap ? "Disable Time Remapping" : "Enable Time Remapping", action: () => selectedVideoLayer && toggleTimeRemap(selectedVideoLayer.id), disabled: !selectedVideoLayer },
       { label: "Freeze Frame", action: () => selectedVideoLayer && freezeTimeRemap(selectedVideoLayer.id), disabled: !selectedVideoLayer },

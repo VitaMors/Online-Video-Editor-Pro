@@ -59,6 +59,7 @@ function curveBandControls(prefix: string, label: string): NumberControlDefiniti
 }
 
 export const EFFECT_ORDER: EffectType[] = [
+  "transform3d",
   "colorGrading",
   "hueSaturation",
   "levels",
@@ -77,6 +78,22 @@ export const EFFECT_ORDER: EffectType[] = [
 ];
 
 export const EFFECT_DEFINITIONS: Record<EffectType, EffectDefinition> = {
+  transform3d: {
+    type: "transform3d",
+    label: "3D Transform",
+    controls: [
+      { key: "billboard", label: "Billboard", kind: "boolean", defaultValue: false },
+      numberControl("positionX", "X Position", 0, -10000, 10000, 1),
+      numberControl("positionY", "Y Position", 0, -10000, 10000, 1),
+      numberControl("positionZ", "Z Position", 0, -10000, 10000, 1),
+      numberControl("scaleX", "X Scale", 100, -1000, 1000, 0.5),
+      numberControl("scaleY", "Y Scale", 100, -1000, 1000, 0.5),
+      numberControl("scaleZ", "Z Scale", 100, -1000, 1000, 0.5),
+      numberControl("rotationX", "X Rotation", 0, -3600, 3600, 0.25),
+      numberControl("rotationY", "Y Rotation", 0, -3600, 3600, 0.25),
+      numberControl("rotationZ", "Z Rotation", 0, -3600, 3600, 0.25),
+    ],
+  },
   colorGrading: {
     type: "colorGrading",
     label: "Color Grading & Balance",
@@ -220,7 +237,7 @@ export const EFFECT_DEFINITIONS: Record<EffectType, EffectDefinition> = {
     controls: [
       { key: "basedOnAlpha", label: "Based On Alpha", kind: "boolean", defaultValue: false },
       { key: "useSourceColors", label: "Use Source Colors", kind: "boolean", defaultValue: true },
-      { key: "color", label: "Glow Color", kind: "color", defaultValue: "#39d0c8" },
+      { key: "color", label: "Tint Color (Source Colors Off)", kind: "color", defaultValue: "#39d0c8" },
       { key: "threshold", label: "Threshold", kind: "number", defaultValue: 60, min: 0, max: 100, step: 1 },
       { key: "radius", label: "Radius", kind: "number", defaultValue: 20, min: 0, max: 240, step: 0.5 },
       { key: "intensity", label: "Intensity", kind: "number", defaultValue: 100, min: 0, max: 500, step: 1 },
@@ -259,12 +276,16 @@ export function isEffectNumberControl(value: unknown): value is AnimatableProper
   return typeof value === "object" && value !== null && "value" in value && "keyframes" in value && Array.isArray((value as AnimatableProperty<number>).keyframes);
 }
 
+function defaultEffectControl(control: EffectControlDefinition): Effect["controls"][string] {
+  return control.kind === "number" ? animatable(control.defaultValue) : control.defaultValue;
+}
+
 export function createEffect(type: EffectType): Effect {
   const definition = EFFECT_DEFINITIONS[type];
   const controls: Effect["controls"] = {};
 
   definition.controls.forEach((control) => {
-    controls[control.key] = control.kind === "number" ? animatable(control.defaultValue) : control.defaultValue;
+    controls[control.key] = defaultEffectControl(control);
   });
 
   return {
@@ -274,6 +295,23 @@ export function createEffect(type: EffectType): Effect {
     enabled: true,
     controls,
   };
+}
+
+export function withEffectControlDefaults(effect: Effect): Effect {
+  const definition = EFFECT_DEFINITIONS[effect.type];
+  let changed = false;
+  const controls: Effect["controls"] = { ...effect.controls };
+
+  definition.controls.forEach((control) => {
+    const current = controls[control.key];
+    const missing = typeof current === "undefined";
+    const wrongKind = control.kind === "number" ? !isEffectNumberControl(current) : isEffectNumberControl(current);
+    if (!missing && !wrongKind) return;
+    controls[control.key] = defaultEffectControl(control);
+    changed = true;
+  });
+
+  return changed ? { ...effect, controls } : effect;
 }
 
 export function resetEffectControls(effect: Effect): Effect {
@@ -297,7 +335,9 @@ export function effectNumericControlKeys(effect: Effect) {
 
 export function effectNumberValue(effect: Effect, key: string, frame: number) {
   const control = effect.controls[key];
-  return isEffectNumberControl(control) ? evaluateProperty(control, frame) : 0;
+  if (isEffectNumberControl(control)) return evaluateProperty(control, frame);
+  const definition = effectControlDefinition(effect, key);
+  return definition?.kind === "number" ? definition.defaultValue : 0;
 }
 
 export function clampedEffectNumberValue(effect: Effect, key: string, value: number) {
@@ -309,5 +349,7 @@ export function clampedEffectNumberValue(effect: Effect, key: string, value: num
 
 export function effectStaticValue(effect: Effect, key: string) {
   const value = effect.controls[key];
-  return isEffectNumberControl(value) ? undefined : value;
+  if (!isEffectNumberControl(value) && typeof value !== "undefined") return value;
+  const definition = effectControlDefinition(effect, key);
+  return definition && definition.kind !== "number" ? definition.defaultValue : undefined;
 }

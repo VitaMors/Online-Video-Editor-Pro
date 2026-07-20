@@ -6,7 +6,7 @@ import { useEditorStore } from "../store/editorStore";
 import type { AnimatableProperty, AnimatableValue, EasePreset, Effect, EffectPropertyKey, Keyframe, Mask, MaskPropertyKey, SpatialVector, TransformPropertyKey } from "../types/editor";
 
 const rows: TransformPropertyKey[] = ["position", "scale", "rotation", "opacity", "anchorPoint"];
-const modelRows: TransformPropertyKey[] = ["position", "scale", "rotationX", "rotationY", "rotation", "opacity", "anchorPoint"];
+const threeDRows: TransformPropertyKey[] = ["position", "scale", "rotationX", "rotationY", "rotation", "opacity", "anchorPoint"];
 
 function isTuple(value: AnimatableValue): value is [number, number] {
   return Array.isArray(value);
@@ -447,7 +447,7 @@ export function PropertyInspector({ collapsed = false, mobile = false, onToggleC
             <ChevronDown size={15} /> Transform
           </div>
           <div className="pb-3">
-            {(layer.type === "model" ? modelRows : rows).map((property) => {
+            {((layer.type === "model" || layer.type === "camera") ? threeDRows : rows).map((property) => {
               const propertyState = layer.transform[property];
               if (!propertyState) return null;
               const value = evaluateProperty(propertyState as AnimatableProperty<AnimatableValue>, playheadFrame);

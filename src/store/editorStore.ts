@@ -10,7 +10,7 @@ import {
   upsertKeyframe,
 } from "../lib/animation";
 import { createComposition, createDefaultProject, createId, createLayer } from "../lib/factories";
-import { clampedEffectNumberValue, createEffect, effectNumericControlKeys, isEffectNumberControl, resetEffectControls } from "../lib/effects";
+import { clampedEffectNumberValue, createEffect, effectNumericControlKeys, isEffectNumberControl, resetEffectControls, withEffectControlDefaults } from "../lib/effects";
 import type {
   AnimatableProperty,
   AnimatableValue,
@@ -302,11 +302,12 @@ function isAnimatableNumberProperty(value: unknown): value is AnimatableProperty
 }
 
 function cloneEffectForLayer(effect: Layer["effects"][number]): Layer["effects"][number] {
+  const hydrated = withEffectControlDefaults(effect);
   const controls: Layer["effects"][number]["controls"] = {};
-  Object.entries(effect.controls).forEach(([key, control]) => {
+  Object.entries(hydrated.controls).forEach(([key, control]) => {
     controls[key] = isAnimatableNumberProperty(control) ? cloneAnimatableProperty(control) : control;
   });
-  return { ...effect, id: createId("effect"), enabled: effect.enabled !== false, controls };
+  return withEffectControlDefaults({ ...hydrated, id: createId("effect"), enabled: hydrated.enabled !== false, controls });
 }
 
 function mapEffectNumberControls(
@@ -505,6 +506,19 @@ function invertLegacyMixValue(value: unknown) {
   return Math.min(100, Math.max(0, 100 - numeric));
 }
 
+function withProjectEffectControlDefaults(project: Project): Project {
+  return {
+    ...project,
+    compositions: project.compositions.map((composition) => ({
+      ...composition,
+      layers: composition.layers.map((layer) => ({
+        ...layer,
+        effects: layer.effects.map(withEffectControlDefaults),
+      })),
+    })),
+  };
+}
+
 function migrateEffectMixToBlendWithOriginal(project: Project): Project {
   return {
     ...project,
@@ -536,10 +550,15 @@ function migrateEffectMixToBlendWithOriginal(project: Project): Project {
 }
 
 function migratePersistedState(persistedState: unknown, version: number) {
-  if (version >= 2 || typeof persistedState !== "object" || persistedState === null) return persistedState;
+  if (typeof persistedState !== "object" || persistedState === null) return persistedState;
   const state = persistedState as Partial<EditorState>;
   if (!state.project) return persistedState;
-  return { ...state, project: migrateEffectMixToBlendWithOriginal(state.project) };
+
+  let project = state.project;
+  if (version < 2) project = migrateEffectMixToBlendWithOriginal(project);
+  if (version < 3) project = withProjectEffectControlDefaults(project);
+
+  return { ...state, project };
 }
 
 const defaultProject = createDefaultProject();
@@ -676,7 +695,7 @@ export const useEditorStore = create<EditorState>()(
       },
       replaceProject: (project) => {
         lastHistoryAt = 0;
-        const nextProject = project.compositions.length > 0 ? project : createDefaultProject();
+        const nextProject = withProjectEffectControlDefaults(project.compositions.length > 0 ? project : createDefaultProject());
         const composition = nextProject.compositions[0];
         baseSet({
           project: nextProject,
@@ -698,7 +717,7 @@ export const useEditorStore = create<EditorState>()(
         set((state) => {
           const composition = createComposition({ name: `Composition ${state.project.compositions.length + 1}`, ...overrides });
           return {
-            project: { ...state.project, compositions: [...state.project.compositions, composition] },
+            project: withProjectEffectControlDefaults({ ...state.project, compositions: [...state.project.compositions, composition] }),
             activeCompositionId: composition.id,
             selectedLayerIds: composition.layers[0] ? [composition.layers[0].id] : [],
             selectedProperty: "position",
@@ -715,7 +734,7 @@ export const useEditorStore = create<EditorState>()(
         set((state) => {
           const nextComposition = { ...composition, id: createId("comp"), name: composition.name || `Composition ${state.project.compositions.length + 1}` };
           return {
-            project: { ...state.project, compositions: [...state.project.compositions, nextComposition] },
+            project: withProjectEffectControlDefaults({ ...state.project, compositions: [...state.project.compositions, nextComposition] }),
             activeCompositionId: nextComposition.id,
             selectedLayerIds: nextComposition.layers[0] ? [nextComposition.layers[0].id] : [],
             selectedProperty: "position",
@@ -1061,14 +1080,15 @@ export const useEditorStore = create<EditorState>()(
               ...layer,
               effects: layer.effects.map((effect) => {
                 if (effect.id !== effectId) return effect;
-                const control = effect.controls[property];
-                if (!isEffectNumberControl(control)) return effect;
-                const nextValue = clampedEffectNumberValue(effect, property, value);
+                const hydrated = withEffectControlDefaults(effect);
+                const control = hydrated.controls[property];
+                if (!isEffectNumberControl(control)) return hydrated;
+                const nextValue = clampedEffectNumberValue(hydrated, property, value);
                 const nextControl = control.animated
                   ? upsertKeyframe(control, state.playheadFrame, nextValue, () => createId("key"))
                   : { ...control, value: nextValue };
                 if (control.animated) selectedKeyframeId = nextControl.keyframes.find((keyframe) => keyframe.frame === state.playheadFrame)?.id;
-                return { ...effect, controls: { ...effect.controls, [property]: nextControl } };
+                return { ...hydrated, controls: { ...hydrated.controls, [property]: nextControl } };
               }),
             })),
             selectedLayerIds: [layerId],
@@ -1085,7 +1105,10 @@ export const useEditorStore = create<EditorState>()(
           project: updateLayer(state, layerId, (layer) => ({
             ...layer,
             effects: layer.effects.map((effect) => effect.id === effectId
-              ? { ...effect, controls: { ...effect.controls, [property]: value } }
+              ? (() => {
+                const hydrated = withEffectControlDefaults(effect);
+                return { ...hydrated, controls: { ...hydrated.controls, [property]: value } };
+              })()
               : effect),
           })),
           selectedLayerIds: [layerId],
@@ -1100,14 +1123,15 @@ export const useEditorStore = create<EditorState>()(
               ...layer,
               effects: layer.effects.map((effect) => {
                 if (effect.id !== effectId) return effect;
-                const control = effect.controls[property];
-                if (!isEffectNumberControl(control)) return effect;
+                const hydrated = withEffectControlDefaults(effect);
+                const control = hydrated.controls[property];
+                if (!isEffectNumberControl(control)) return hydrated;
                 const value = evaluateProperty(control, state.playheadFrame);
                 const nextControl = control.animated
                   ? { ...control, animated: false, value }
                   : upsertKeyframe(control, state.playheadFrame, value, () => createId("key"));
                 if (!control.animated) selectedKeyframeId = nextControl.keyframes.find((keyframe) => keyframe.frame === state.playheadFrame)?.id;
-                return { ...effect, controls: { ...effect.controls, [property]: nextControl } };
+                return { ...hydrated, controls: { ...hydrated.controls, [property]: nextControl } };
               }),
             })),
             selectedLayerIds: [layerId],
@@ -1127,12 +1151,13 @@ export const useEditorStore = create<EditorState>()(
               ...layer,
               effects: layer.effects.map((effect) => {
                 if (effect.id !== effectId) return effect;
-                const control = effect.controls[property];
-                if (!isEffectNumberControl(control)) return effect;
+                const hydrated = withEffectControlDefaults(effect);
+                const control = hydrated.controls[property];
+                if (!isEffectNumberControl(control)) return hydrated;
                 const value = evaluateProperty(control, state.playheadFrame);
                 const nextControl = upsertKeyframe(control, state.playheadFrame, value, () => createId("key"));
                 selectedKeyframeId = nextControl.keyframes.find((keyframe) => keyframe.frame === state.playheadFrame)?.id;
-                return { ...effect, controls: { ...effect.controls, [property]: nextControl } };
+                return { ...hydrated, controls: { ...hydrated.controls, [property]: nextControl } };
               }),
             })),
             selectedLayerIds: [layerId],
@@ -1150,13 +1175,14 @@ export const useEditorStore = create<EditorState>()(
             ...layer,
             effects: layer.effects.map((effect) => {
               if (effect.id !== effectId) return effect;
-              const control = effect.controls[property];
-              if (!isEffectNumberControl(control)) return effect;
+              const hydrated = withEffectControlDefaults(effect);
+              const control = hydrated.controls[property];
+              if (!isEffectNumberControl(control)) return hydrated;
               const nextFrame = openKeyframeFrame(control.keyframes, keyframeId, frame, maxFrameForState(state));
               return {
-                ...effect,
+                ...hydrated,
                 controls: {
-                  ...effect.controls,
+                  ...hydrated.controls,
                   [property]: {
                     ...control,
                     keyframes: control.keyframes
@@ -1999,7 +2025,7 @@ export const useEditorStore = create<EditorState>()(
     },
     {
       name: "ovepro-foundation",
-      version: 2,
+      version: 3,
       migrate: migratePersistedState,
       storage: createJSONStorage(() => localStorage),
       partialize: (state) => ({

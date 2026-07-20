@@ -105,35 +105,94 @@ function screenToComposition(
   return [(canvasX - current.x) / current.scale, (canvasY - current.y) / current.scale];
 }
 
-function compositionToLayerPoint(composition: Composition, layer: Layer, frame: number, point: Vector2): Vector2 {
-  const position = getWorldPosition(composition, layer, frame);
-  const scale = evaluateProperty(layer.transform.scale, frame);
-  const rotation = evaluateProperty(layer.transform.rotation, frame);
-  const anchor = evaluateProperty(layer.transform.anchorPoint, frame);
-  const radians = (-rotation * Math.PI) / 180;
-  const translatedX = point[0] - position[0];
-  const translatedY = point[1] - position[1];
-  const rotatedX = translatedX * Math.cos(radians) - translatedY * Math.sin(radians);
-  const rotatedY = translatedX * Math.sin(radians) + translatedY * Math.cos(radians);
+type LayerTransform2D = {
+  position: Vector2;
+  scale: Vector2;
+  rotation: number;
+  anchor: Vector2;
+};
+
+function transform3DEffect(layer: Layer) {
+  if (layer.type === "model" || layer.type === "camera" || layer.type === "audio" || layer.type === "null" || layer.type === "adjustment") return undefined;
+  return layer.effects.find((effect) => effect.enabled !== false && effect.type === "transform3d");
+}
+
+function layerTransform2D(composition: Composition, layer: Layer, frame: number, activeCamera?: Layer): LayerTransform2D {
+  const worldPosition2D = getWorldPosition(composition, layer, frame);
+  const baseScale = evaluateProperty(layer.transform.scale, frame);
+  const baseRotation = evaluateProperty(layer.transform.rotation, frame);
+  const anchorValue = evaluateProperty(layer.transform.anchorPoint, frame);
+  const anchor: Vector2 = [anchorValue[0], anchorValue[1]];
+  const effect = transform3DEffect(layer);
+
+  if (!effect) {
+    return {
+      position: worldPosition2D,
+      scale: [baseScale[0] / 100, baseScale[1] / 100],
+      rotation: baseRotation,
+      anchor,
+    };
+  }
+
+  const cameraPosition = activeCamera ? evaluateProperty(activeCamera.transform.position, frame) : [composition.width / 2, composition.height / 2, -900] as SpatialVector;
+  const cameraRotationX = activeCamera ? finiteNumber(evaluateProperty(activeCamera.transform.rotationX, frame), 0) : 0;
+  const cameraRotationY = activeCamera ? finiteNumber(evaluateProperty(activeCamera.transform.rotationY, frame), 0) : 0;
+  const cameraRotationZ = activeCamera ? finiteNumber(evaluateProperty(activeCamera.transform.rotation, frame), 0) : 0;
+  const cameraFov = Math.max(5, Math.min(140, finiteNumber(activeCamera?.source?.cameraFov, 35)));
+  const focus = 900 * Math.tan(radians(35) / 2) / Math.tan(radians(cameraFov) / 2);
+  const localX = effectNumberValue(effect, "positionX", frame);
+  const localY = effectNumberValue(effect, "positionY", frame);
+  const localZ = effectNumberValue(effect, "positionZ", frame);
+  const world = new THREE.Vector3(worldPosition2D[0] + localX, -(worldPosition2D[1] + localY), localZ);
+  const camera = new THREE.Vector3(
+    numericVectorComponent(cameraPosition, 0, composition.width / 2),
+    -numericVectorComponent(cameraPosition, 1, composition.height / 2),
+    numericVectorComponent(cameraPosition, 2, -900),
+  );
+  const relative = world.sub(camera);
+  relative.applyEuler(new THREE.Euler(radians(-cameraRotationX), radians(-cameraRotationY), radians(-cameraRotationZ), "YXZ"));
+  const distance = Math.max(10, relative.z);
+  const projectionScale = Math.max(0.01, Math.min(80, focus / distance));
+  const billboard = Boolean(effectStaticValue(effect, "billboard"));
+  const effectScaleX = effectNumberValue(effect, "scaleX", frame) / 100;
+  const effectScaleY = effectNumberValue(effect, "scaleY", frame) / 100;
+  const rotateX = effectNumberValue(effect, "rotationX", frame);
+  const rotateY = effectNumberValue(effect, "rotationY", frame);
+  const rotateZ = effectNumberValue(effect, "rotationZ", frame);
+  const xFacing = billboard ? 1 : Math.max(0.05, Math.abs(Math.cos(radians(rotateY))));
+  const yFacing = billboard ? 1 : Math.max(0.05, Math.abs(Math.cos(radians(rotateX))));
+
+  return {
+    position: [composition.width / 2 + relative.x * projectionScale, composition.height / 2 - relative.y * projectionScale],
+    scale: [baseScale[0] / 100 * effectScaleX * projectionScale * xFacing, baseScale[1] / 100 * effectScaleY * projectionScale * yFacing],
+    rotation: baseRotation + rotateZ,
+    anchor,
+  };
+}
+
+function compositionToLayerPoint(composition: Composition, layer: Layer, frame: number, point: Vector2, activeCamera?: Layer): Vector2 {
+  const transform = layerTransform2D(composition, layer, frame, activeCamera);
+  const angle = radians(-transform.rotation);
+  const translatedX = point[0] - transform.position[0];
+  const translatedY = point[1] - transform.position[1];
+  const rotatedX = translatedX * Math.cos(angle) - translatedY * Math.sin(angle);
+  const rotatedY = translatedX * Math.sin(angle) + translatedY * Math.cos(angle);
 
   return [
-    rotatedX / Math.max(0.001, scale[0] / 100) + anchor[0],
-    rotatedY / Math.max(0.001, scale[1] / 100) + anchor[1],
+    rotatedX / Math.max(0.001, transform.scale[0]) + transform.anchor[0],
+    rotatedY / Math.max(0.001, transform.scale[1]) + transform.anchor[1],
   ];
 }
 
-function layerPointToComposition(composition: Composition, layer: Layer, frame: number, point: Vector2): Vector2 {
-  const position = getWorldPosition(composition, layer, frame);
-  const scale = evaluateProperty(layer.transform.scale, frame);
-  const rotation = evaluateProperty(layer.transform.rotation, frame);
-  const anchor = evaluateProperty(layer.transform.anchorPoint, frame);
-  const radians = (rotation * Math.PI) / 180;
-  const scaledX = (point[0] - anchor[0]) * (scale[0] / 100);
-  const scaledY = (point[1] - anchor[1]) * (scale[1] / 100);
+function layerPointToComposition(composition: Composition, layer: Layer, frame: number, point: Vector2, activeCamera?: Layer): Vector2 {
+  const transform = layerTransform2D(composition, layer, frame, activeCamera);
+  const angle = radians(transform.rotation);
+  const scaledX = (point[0] - transform.anchor[0]) * transform.scale[0];
+  const scaledY = (point[1] - transform.anchor[1]) * transform.scale[1];
 
   return [
-    position[0] + scaledX * Math.cos(radians) - scaledY * Math.sin(radians),
-    position[1] + scaledX * Math.sin(radians) + scaledY * Math.cos(radians),
+    transform.position[0] + scaledX * Math.cos(angle) - scaledY * Math.sin(angle),
+    transform.position[1] + scaledX * Math.sin(angle) + scaledY * Math.cos(angle),
   ];
 }
 
@@ -172,16 +231,13 @@ function textEditBox(
   };
 }
 
-function applyLayerTransform(context: CanvasRenderingContext2D, composition: Composition, layer: Layer, frame: number) {
-  const position = getWorldPosition(composition, layer, frame);
-  const scale = evaluateProperty(layer.transform.scale, frame);
-  const rotation = evaluateProperty(layer.transform.rotation, frame);
-  const anchorPoint = evaluateProperty(layer.transform.anchorPoint, frame);
+function applyLayerTransform(context: CanvasRenderingContext2D, composition: Composition, layer: Layer, frame: number, activeCamera?: Layer) {
+  const transform = layerTransform2D(composition, layer, frame, activeCamera);
 
-  context.translate(position[0], position[1]);
-  context.rotate((rotation * Math.PI) / 180);
-  context.scale(scale[0] / 100, scale[1] / 100);
-  context.translate(-anchorPoint[0], -anchorPoint[1]);
+  context.translate(transform.position[0], transform.position[1]);
+  context.rotate(radians(transform.rotation));
+  context.scale(transform.scale[0], transform.scale[1]);
+  context.translate(-transform.anchor[0], -transform.anchor[1]);
 }
 
 function drawGrid(context: CanvasRenderingContext2D, composition: Composition) {
@@ -320,9 +376,63 @@ function numericVectorComponent(value: unknown, index: number, fallback: number)
   return Array.isArray(value) && typeof value[index] === "number" && Number.isFinite(value[index]) ? value[index] : fallback;
 }
 
+function activeCameraLayer(composition: Composition, frame: number) {
+  return composition.layers.find((layer) => layer.type === "camera" && layer.visible !== false && frame >= layer.startFrame && frame < layer.endFrame);
+}
+
+function radians(value: number) {
+  return (value * Math.PI) / 180;
+}
+
+function configureModelCamera(
+  camera: THREE.PerspectiveCamera,
+  composition: Composition,
+  modelLayer: Layer,
+  cameraLayer: Layer | undefined,
+  frame: number,
+  width: number,
+  height: number,
+  modelZPosition: number,
+) {
+  camera.aspect = Math.max(1, Math.round(width)) / Math.max(1, Math.round(height));
+
+  if (!cameraLayer) {
+    const cameraDistance = Math.max(1.35, Math.min(14, 4.4 - modelZPosition / 260));
+    camera.fov = 35;
+    camera.near = 0.01;
+    camera.far = 1000;
+    camera.position.set(0, 0, cameraDistance);
+    camera.lookAt(0, 0, 0);
+    camera.updateProjectionMatrix();
+    return;
+  }
+
+  const cameraPosition = evaluateProperty(cameraLayer.transform.position, frame);
+  const modelPosition = evaluateProperty(modelLayer.transform.position, frame);
+  const cameraRotationX = finiteNumber(evaluateProperty(cameraLayer.transform.rotationX, frame), 0);
+  const cameraRotationY = finiteNumber(evaluateProperty(cameraLayer.transform.rotationY, frame), 0);
+  const cameraRotationZ = finiteNumber(evaluateProperty(cameraLayer.transform.rotation, frame), 0);
+  const source = cameraLayer.source;
+  const cameraZ = numericVectorComponent(cameraPosition, 2, -900);
+  const relativeX = numericVectorComponent(cameraPosition, 0, composition.width / 2) - numericVectorComponent(modelPosition, 0, composition.width / 2);
+  const relativeY = numericVectorComponent(cameraPosition, 1, composition.height / 2) - numericVectorComponent(modelPosition, 1, composition.height / 2);
+  const cameraX = (relativeX / Math.max(1, width)) * 3.2;
+  const cameraY = -(relativeY / Math.max(1, height)) * 3.2;
+  const cameraDistance = Math.max(0.35, Math.min(60, 4.4 - (cameraZ + 900) / 260 - modelZPosition / 260));
+
+  camera.fov = Math.max(5, Math.min(140, finiteNumber(source?.cameraFov, 35)));
+  camera.near = Math.max(0.001, finiteNumber(source?.cameraNear, 0.01));
+  camera.far = Math.max(camera.near + 1, finiteNumber(source?.cameraFar, 1000));
+  camera.position.set(cameraX, cameraY, cameraDistance);
+  camera.rotation.set(radians(cameraRotationX), radians(cameraRotationY), radians(cameraRotationZ), "YXZ");
+  camera.updateProjectionMatrix();
+}
+
 function drawModelScene(
   context: CanvasRenderingContext2D,
+  composition: Composition,
   layer: Layer,
+  activeCamera: Layer | undefined,
   modelScene: THREE.Object3D,
   modelUrl: string,
   frame: number,
@@ -365,11 +475,7 @@ function drawModelScene(
   runtime.scene.add(rimLight);
   runtime.scene.add(group);
 
-  const cameraDistance = Math.max(1.35, Math.min(14, 4.4 - zPosition / 260));
-  runtime.camera.aspect = Math.max(1, Math.round(width)) / Math.max(1, Math.round(height));
-  runtime.camera.position.set(0, 0, cameraDistance);
-  runtime.camera.lookAt(0, 0, 0);
-  runtime.camera.updateProjectionMatrix();
+  configureModelCamera(runtime.camera, composition, layer, activeCamera, frame, width, height, zPosition);
 
   runtime.renderer.clear(true, true, true);
   runtime.renderer.render(runtime.scene, runtime.camera);
@@ -470,12 +576,14 @@ function rememberVideoFrame(videoUrl: string, video: HTMLVideoElement, width: nu
 }
 function drawLayerContent(
   context: CanvasRenderingContext2D,
+  composition: Composition,
   layer: Layer,
   images: Map<string, HTMLImageElement>,
   videos: Map<string, HTMLVideoElement>,
   frame: number,
   fps: number,
   liveVideoPlayback = false,
+  activeCamera?: Layer,
 ) {
   const [width, height] = getLayerSize(layer);
   const source = layer.source;
@@ -516,7 +624,7 @@ function drawLayerContent(
   if (layer.type === "model" && source?.modelUrl) {
     const cachedModel = modelCache.get(source.modelUrl);
     const label = source.fileName ? `3D Model: ${source.fileName}` : "3D Model";
-    if (cachedModel?.status === "ready" && cachedModel.scene && drawModelScene(context, layer, cachedModel.scene, source.modelUrl, frame, width, height)) {
+    if (cachedModel?.status === "ready" && cachedModel.scene && drawModelScene(context, composition, layer, activeCamera, cachedModel.scene, source.modelUrl, frame, width, height)) {
       return;
     }
     drawModelPlaceholder(context, width, height, cachedModel?.status === "error" ? "Could not load 3D Model" : cachedModel?.status === "loading" ? "Loading 3D Model" : label);
@@ -1096,12 +1204,14 @@ function applyAdjustmentLayerMask(
 
 function drawMaskedLayerContent(
   context: CanvasRenderingContext2D,
+  composition: Composition,
   layer: Layer,
   frame: number,
   images: Map<string, HTMLImageElement>,
   videos: Map<string, HTMLVideoElement>,
   fps: number,
   liveVideoPlayback: boolean,
+  activeCamera?: Layer,
 ) {
   const [width, height] = getLayerSize(layer);
   const effectPadding = glowSpreadPadding(layer, frame);
@@ -1111,13 +1221,13 @@ function drawMaskedLayerContent(
   const contentContext = contentCanvas.getContext("2d");
 
   if (!contentContext) {
-    drawLayerContent(context, layer, images, videos, frame, fps, liveVideoPlayback);
+    drawLayerContent(context, composition, layer, images, videos, frame, fps, liveVideoPlayback, activeCamera);
     return;
   }
 
   contentContext.save();
   contentContext.translate(effectPadding, effectPadding);
-  drawLayerContent(contentContext, layer, images, videos, frame, fps, liveVideoPlayback);
+  drawLayerContent(contentContext, composition, layer, images, videos, frame, fps, liveVideoPlayback, activeCamera);
   contentContext.restore();
 
   if (layer.masks.length > 0) {
@@ -1183,10 +1293,11 @@ function drawLayerOverlay(
   layer: Layer,
   frame: number,
   selectedMaskId?: string,
+  activeCamera?: Layer,
 ) {
   const [width, height] = getLayerSize(layer);
   context.save();
-  applyLayerTransform(context, composition, layer, frame);
+  applyLayerTransform(context, composition, layer, frame, activeCamera);
   context.globalAlpha = 1;
   context.lineWidth = 3;
   context.strokeStyle = "#f2b84b";
@@ -1202,6 +1313,45 @@ function drawLayerOverlay(
   context.restore();
 }
 
+function drawCameraLayerOverlay(
+  context: CanvasRenderingContext2D,
+  composition: Composition,
+  layer: Layer,
+  frame: number,
+) {
+  const [width, height] = getLayerSize(layer);
+  context.save();
+  applyLayerTransform(context, composition, layer, frame);
+  context.globalAlpha = 1;
+  context.lineWidth = 3;
+  context.strokeStyle = "#f2b84b";
+  context.fillStyle = "#f2b84b";
+  context.setLineDash([14, 8]);
+  context.strokeRect(0, 0, width, height);
+  context.setLineDash([]);
+
+  const bodyWidth = Math.max(54, width * 0.42);
+  const bodyHeight = Math.max(36, height * 0.32);
+  const bodyX = width * 0.22;
+  const bodyY = height * 0.32;
+  context.strokeRect(bodyX, bodyY, bodyWidth, bodyHeight);
+  context.beginPath();
+  context.moveTo(bodyX + bodyWidth, bodyY + bodyHeight * 0.28);
+  context.lineTo(width * 0.86, height * 0.22);
+  context.lineTo(width * 0.86, height * 0.78);
+  context.lineTo(bodyX + bodyWidth, bodyY + bodyHeight * 0.72);
+  context.closePath();
+  context.stroke();
+  context.beginPath();
+  context.arc(bodyX + bodyWidth * 0.34, bodyY + bodyHeight * 0.5, Math.max(7, Math.min(bodyWidth, bodyHeight) * 0.2), 0, Math.PI * 2);
+  context.stroke();
+
+  const handle = 16;
+  [[0, 0], [width, 0], [width, height], [0, height]].forEach(([x, y]) => {
+    context.fillRect(x - handle / 2, y - handle / 2, handle, handle);
+  });
+  context.restore();
+}
 function drawAdjustmentLayerOverlay(
   context: CanvasRenderingContext2D,
   composition: Composition,
@@ -1254,6 +1404,7 @@ function drawLayer(
   selected: boolean,
   selectedMaskId?: string,
   liveVideoPlayback = false,
+  activeCamera?: Layer,
 ) {
   const fps = finiteNumber(composition.fps, 30);
   const motionAmount = composition.motionBlur && layer.motionBlur ? transformMotionAmount(composition, layer, frame) : 0;
@@ -1267,7 +1418,7 @@ function drawLayer(
     context.save();
     context.globalAlpha = (opacity / 100) * alphaScale;
     applyLayerTransform(context, composition, layer, sampleFrame);
-    drawMaskedLayerContent(context, layer, contentFrame, images, videos, fps, liveVideoPlayback);
+    drawMaskedLayerContent(context, composition, layer, contentFrame, images, videos, fps, liveVideoPlayback, activeCamera);
     context.restore();
   };
 
@@ -1282,7 +1433,7 @@ function drawLayer(
     drawContentSample(frame, 1);
   }
 
-  if (selected) drawLayerOverlay(context, composition, layer, frame, selectedMaskId);
+  if (selected) drawLayerOverlay(context, composition, layer, frame, selectedMaskId, activeCamera);
 }
 function drawDraftMask(
   context: CanvasRenderingContext2D,
@@ -1290,12 +1441,13 @@ function drawDraftMask(
   layer: Layer,
   frame: number,
   draft: MaskDraft,
+  activeCamera?: Layer,
 ) {
   const points = draft.hover ? [...draft.points, draft.hover] : draft.points;
   if (points.length === 0) return;
 
   context.save();
-  applyLayerTransform(context, composition, layer, frame);
+  applyLayerTransform(context, composition, layer, frame, activeCamera);
   context.strokeStyle = "#39d0c8";
   context.fillStyle = "#39d0c8";
   context.lineWidth = 2;
@@ -1346,6 +1498,7 @@ function renderCompositionFrame(
   if (options.showGrid) drawGrid(context, composition);
 
   const soloActive = composition.layers.some((layer) => layer.solo);
+  const activeCamera = activeCameraLayer(composition, frame);
   const drawableLayers = composition.layers
     .slice()
     .reverse()
@@ -1361,26 +1514,27 @@ function renderCompositionFrame(
         applyAdjustmentLayerToCanvas(contentCanvas, composition, layer, frame);
         return;
       }
-      drawLayer(contentContext, composition, layer, frame, options.images, options.videos, false, options.selectedMaskId, options.liveVideoPlayback);
+      drawLayer(contentContext, composition, layer, frame, options.images, options.videos, false, options.selectedMaskId, options.liveVideoPlayback, activeCamera);
     });
     context.drawImage(contentCanvas, 0, 0, composition.width, composition.height);
   } else {
     drawableLayers
       .filter((layer) => layer.type !== "adjustment")
-      .forEach((layer) => drawLayer(context, composition, layer, frame, options.images, options.videos, false, options.selectedMaskId, options.liveVideoPlayback));
+      .forEach((layer) => drawLayer(context, composition, layer, frame, options.images, options.videos, false, options.selectedMaskId, options.liveVideoPlayback, activeCamera));
   }
 
   if (options.includeOverlays) {
     drawableLayers
       .filter((layer) => selectedLayerIds.includes(layer.id))
       .forEach((layer) => {
-        if (layer.type === "adjustment") drawAdjustmentLayerOverlay(context, composition, layer, frame, options.selectedMaskId);
-        else drawLayerOverlay(context, composition, layer, frame, options.selectedMaskId);
+        if (layer.type === "camera") drawCameraLayerOverlay(context, composition, layer, frame);
+        else if (layer.type === "adjustment") drawAdjustmentLayerOverlay(context, composition, layer, frame, options.selectedMaskId);
+        else drawLayerOverlay(context, composition, layer, frame, options.selectedMaskId, activeCamera);
       });
 
     if (options.maskDraft) {
       const layer = composition.layers.find((candidate) => candidate.id === options.maskDraft?.layerId);
-      if (layer) drawDraftMask(context, composition, layer, frame, options.maskDraft);
+      if (layer) drawDraftMask(context, composition, layer, frame, options.maskDraft, activeCamera);
     }
   }
 
@@ -1392,9 +1546,9 @@ function renderCompositionFrame(
     context.strokeRect(0, 0, composition.width, composition.height);
   }
 }
-function hitTestLayer(composition: Composition, layer: Layer, frame: number, point: Vector2) {
+function hitTestLayer(composition: Composition, layer: Layer, frame: number, point: Vector2, activeCamera?: Layer) {
   const [width, height] = getLayerSize(layer);
-  const local = compositionToLayerPoint(composition, layer, frame, point);
+  const local = compositionToLayerPoint(composition, layer, frame, point, activeCamera);
   return local[0] >= 0 && local[0] <= width && local[1] >= 0 && local[1] <= height;
 }
 
@@ -1415,6 +1569,7 @@ function maskVertexHitForLayer(
   point: Vector2,
   threshold: number,
   selectedMaskId?: string,
+  activeCamera?: Layer,
 ): MaskVertexHit | undefined {
   const orderedMasks = [
     ...layer.masks.filter((mask) => mask.id === selectedMaskId),
@@ -1425,7 +1580,7 @@ function maskVertexHitForLayer(
 
   orderedMasks.forEach((mask) => {
     evaluatedMaskPoints(mask, frame).forEach((maskPoint, pointIndex) => {
-      const compositionPoint = layerPointToComposition(composition, layer, frame, maskPoint);
+      const compositionPoint = layerPointToComposition(composition, layer, frame, maskPoint, activeCamera);
       const currentDistance = distance(point, compositionPoint);
       if (currentDistance <= closestDistance) {
         closest = { layer, mask, pointIndex };
@@ -1771,7 +1926,8 @@ export function CompositionCanvas() {
     if (!canvas || !composition) return undefined;
     const point = screenToComposition(canvas, composition, canvasZoom, canvasPan, clientX, clientY);
     const soloActive = composition.layers.some((layer) => layer.solo);
-    return composition.layers.find((layer) => layer.type !== "adjustment" && shouldDrawLayer(layer, playheadFrame, soloActive) && !layer.locked && hitTestLayer(composition, layer, playheadFrame, point));
+    const activeCamera = activeCameraLayer(composition, playheadFrame);
+    return composition.layers.find((layer) => layer.type !== "adjustment" && shouldDrawLayer(layer, playheadFrame, soloActive) && !layer.locked && hitTestLayer(composition, layer, playheadFrame, point, activeCamera));
   };
 
   const hitMaskVertexAt = (clientX: number, clientY: number) => {
@@ -1783,6 +1939,7 @@ export function CompositionCanvas() {
     const canvasPixelRatio = canvas.width / Math.max(1, rect.width);
     const threshold = (12 * canvasPixelRatio) / currentPlacement.scale;
     const soloActive = composition.layers.some((layer) => layer.solo);
+    const activeCamera = activeCameraLayer(composition, playheadFrame);
     const drawableLayers = composition.layers.filter((layer) => shouldDrawLayer(layer, playheadFrame, soloActive) && !layer.locked && layer.masks.length > 0);
     const selectedLayers = selectedLayerIds
       .map((layerId) => drawableLayers.find((layer) => layer.id === layerId))
@@ -1793,7 +1950,7 @@ export function CompositionCanvas() {
     ];
 
     for (const layer of orderedLayers) {
-      const hit = maskVertexHitForLayer(composition, layer, playheadFrame, point, threshold, selectedMaskId);
+      const hit = maskVertexHitForLayer(composition, layer, playheadFrame, point, threshold, selectedMaskId, activeCamera);
       if (hit) return hit;
     }
 
@@ -2034,7 +2191,8 @@ export function CompositionCanvas() {
           if (!canvas) return;
           const point = screenToComposition(canvas, composition, canvasZoom, canvasPan, event.clientX, event.clientY);
           const soloActive = composition.layers.some((layer) => layer.solo);
-          const hit = composition.layers.find((layer) => layer.type !== "adjustment" && shouldDrawLayer(layer, playheadFrame, soloActive) && !layer.locked && hitTestLayer(composition, layer, playheadFrame, point));
+          const activeCamera = activeCameraLayer(composition, playheadFrame);
+          const hit = composition.layers.find((layer) => layer.type !== "adjustment" && shouldDrawLayer(layer, playheadFrame, soloActive) && !layer.locked && hitTestLayer(composition, layer, playheadFrame, point, activeCamera));
 
           if (activeTool === "select" && event.detail > 1 && hit?.type === "text") {
             event.preventDefault();
@@ -2057,7 +2215,7 @@ export function CompositionCanvas() {
                 maskId: maskVertexHit.mask.id,
                 pointIndex: maskVertexHit.pointIndex,
                 startPath: evaluatePathProperty(maskVertexHit.mask.path, playheadFrame).map((pathPoint) => [...pathPoint] as Vector2),
-                startPointer: compositionToLayerPoint(composition, maskVertexHit.layer, playheadFrame, point),
+                startPointer: compositionToLayerPoint(composition, maskVertexHit.layer, playheadFrame, point, activeCamera),
                 startScale: evaluateProperty(maskVertexHit.mask.scale, playheadFrame),
               };
               event.currentTarget.setPointerCapture(event.pointerId);
@@ -2067,12 +2225,12 @@ export function CompositionCanvas() {
 
           if (activeTool === "mask") {
             event.preventDefault();
-            const selectedLayer = composition.layers.find((layer) => layer.id === selectedLayerIds[0] && !layer.locked && layer.type !== "null" && layer.type !== "audio" && layer.type !== "model");
+            const selectedLayer = composition.layers.find((layer) => layer.id === selectedLayerIds[0] && !layer.locked && layer.type !== "null" && layer.type !== "audio" && layer.type !== "model" && layer.type !== "camera");
             const targetLayer = selectedLayer ?? hit;
             if (!targetLayer) return;
             if (!selectedLayerIds.includes(targetLayer.id)) selectLayer(targetLayer.id);
 
-            const localPoint = compositionToLayerPoint(composition, targetLayer, playheadFrame, point);
+            const localPoint = compositionToLayerPoint(composition, targetLayer, playheadFrame, point, activeCamera);
             const currentDraft = maskDraft?.layerId === targetLayer.id ? maskDraft : { layerId: targetLayer.id, points: [] };
             const firstPoint = currentDraft.points[0];
             const rect = canvas.getBoundingClientRect();
@@ -2110,7 +2268,8 @@ export function CompositionCanvas() {
             const layer = composition.layers.find((candidate) => candidate.id === maskDraft.layerId);
             if (!layer) return;
             const point = screenToComposition(canvas, composition, canvasZoom, canvasPan, event.clientX, event.clientY);
-            setMaskDraft({ ...maskDraft, hover: compositionToLayerPoint(composition, layer, playheadFrame, point) });
+            const activeCamera = activeCameraLayer(composition, playheadFrame);
+            setMaskDraft({ ...maskDraft, hover: compositionToLayerPoint(composition, layer, playheadFrame, point, activeCamera) });
             return;
           }
 
@@ -2132,7 +2291,8 @@ export function CompositionCanvas() {
             const mask = layer?.masks.find((candidate) => candidate.id === drag.maskId);
             const startPoint = drag.startPath[drag.pointIndex];
             if (!layer || !mask || !startPoint) return;
-            const localPoint = compositionToLayerPoint(composition, layer, playheadFrame, point);
+            const activeCamera = activeCameraLayer(composition, playheadFrame);
+            const localPoint = compositionToLayerPoint(composition, layer, playheadFrame, point, activeCamera);
             const [factorX, factorY] = maskScaleDragFactor(drag.startScale, drag.startPath.length);
             const nextPath = drag.startPath.map((pathPoint) => [...pathPoint] as Vector2);
             nextPath[drag.pointIndex] = [

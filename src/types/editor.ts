@@ -1,4 +1,4 @@
-export type LayerType = "text" | "shape" | "image" | "video" | "audio" | "model" | "solid" | "adjustment" | "null";
+export type LayerType = "text" | "shape" | "image" | "video" | "audio" | "model" | "camera" | "solid" | "adjustment" | "null";
 export type InterpolationType = "linear" | "bezier" | "hold";
 export type GraphMode = "value" | "speed";
 export type EditorTool = "select" | "mask";
@@ -41,6 +41,7 @@ export type TransformPropertyKey = keyof TransformProperties;
 export type MaskPropertyKey = "path" | "feather" | "position" | "scale";
 export type SourcePropertyKey = "timeRemap";
 export type EffectType =
+  | "transform3d"
   | "colorGrading"
   | "hueSaturation"
   | "levels"
@@ -87,6 +88,9 @@ export type LayerSource = {
   audioUrl?: string;
   modelUrl?: string;
   modelFormat?: "glb" | "gltf";
+  cameraFov?: number;
+  cameraNear?: number;
+  cameraFar?: number;
   mediaOffsetFrames?: number;
   mediaDurationFrames?: number;
   timeRemap?: AnimatableProperty<number>;
