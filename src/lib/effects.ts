@@ -75,6 +75,7 @@ export const EFFECT_ORDER: EffectType[] = [
   "noiseGrain",
   "sharpen",
   "invert",
+  "chromaKey",
 ];
 
 export const EFFECT_DEFINITIONS: Record<EffectType, EffectDefinition> = {
@@ -267,6 +268,18 @@ export const EFFECT_DEFINITIONS: Record<EffectType, EffectDefinition> = {
     label: "Invert",
     controls: [
       { key: "amount", label: "Amount", kind: "number", defaultValue: 100, min: 0, max: 100, step: 1 },
+      mixControl,
+    ],
+  },
+  chromaKey: {
+    type: "chromaKey",
+    label: "Chroma Key (Greenscreen)",
+    controls: [
+      { key: "keyColor", label: "Key Color", kind: "color", defaultValue: "#00b140" },
+      { key: "similarity", label: "Similarity", kind: "number", defaultValue: 35, min: 0, max: 100, step: 1 },
+      { key: "smoothness", label: "Edge Smoothness", kind: "number", defaultValue: 12, min: 0, max: 100, step: 1 },
+      { key: "spillSuppression", label: "Spill Suppression", kind: "number", defaultValue: 50, min: 0, max: 100, step: 1 },
+      { key: "showMatte", label: "Show Matte (Preview)", kind: "boolean", defaultValue: false },
       mixControl,
     ],
   },

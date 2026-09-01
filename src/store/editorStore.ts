@@ -14,6 +14,7 @@ import { clampedEffectNumberValue, createEffect, effectNumericControlKeys, isEff
 import type {
   AnimatableProperty,
   AnimatableValue,
+  BlendMode,
   Composition,
   Effect,
   EditorTool,
@@ -116,6 +117,7 @@ type EditorState = {
   toggleLayerFlag: (layerId: string, flag: "visible" | "locked" | "solo" | "motionBlur") => void;
   setParentLayer: (layerId: string, parentId?: string) => void;
   renameLayer: (layerId: string, name: string) => void;
+  setLayerBlendMode: (layerId: string, blendMode: BlendMode) => void;
   updateTextLayer: (layerId: string, text: string) => void;
   reorderLayer: (layerId: string, targetLayerId: string, placement: "above" | "below") => void;
   addPolygonMask: (layerId: string, path: MaskPath) => void;
@@ -1510,6 +1512,8 @@ export const useEditorStore = create<EditorState>()(
         }),
       renameLayer: (layerId, name) =>
         set((state) => ({ project: updateLayer(state, layerId, (layer) => ({ ...layer, name })) })),
+      setLayerBlendMode: (layerId, blendMode) =>
+        set((state) => ({ project: updateLayer(state, layerId, (layer) => ({ ...layer, blendMode })) })),
       updateTextLayer: (layerId, text) =>
         set((state) => ({
           project: updateLayer(state, layerId, (layer) => (

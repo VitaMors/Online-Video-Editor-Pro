@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { evaluatePathProperty, evaluateProperty, getLayerSize, getWorldPosition } from "../lib/animation";
+import { compositeOperationForBlendMode } from "../lib/blendModes";
 import { applyColorGradingShader } from "../lib/colorGradingShader";
 import { effectNumberValue, effectStaticValue, isEffectNumberControl } from "../lib/effects";
 import { useEditorStore } from "../store/editorStore";
@@ -1124,6 +1125,81 @@ function sharpenCanvas(source: HTMLCanvasElement, effect: Effect, frame: number)
   return blendWithOriginal(source, canvas, mix);
 }
 
+// Suppresses green/blue-screen fringing left on kept foreground pixels (hair, motion
+// blur edges) by pulling the key color's dominant channel back down toward the other two
+// whenever it's still spiking - the same "simple" spill-suppression approach used by
+// OBS's chroma key filter, just applied per pixel here.
+function suppressChromaSpill(r: number, g: number, b: number, dominantIndex: 0 | 1 | 2, amount: number): [number, number, number] {
+  if (amount <= 0) return [r, g, b];
+  const channels: [number, number, number] = [r, g, b];
+  const dominant = channels[dominantIndex];
+  const otherA = channels[(dominantIndex + 1) % 3];
+  const otherB = channels[(dominantIndex + 2) % 3];
+  const maxOther = Math.max(otherA, otherB);
+  if (dominant <= maxOther) return [r, g, b];
+  channels[dominantIndex] = dominant - (dominant - maxOther) * amount;
+  return channels;
+}
+
+function chromaKeyCanvas(source: HTMLCanvasElement, effect: Effect, frame: number) {
+  const mix = mixWithOriginalAmount(effect, frame);
+  if (mix >= 0.999) return source;
+
+  const [kr, kg, kb] = colorFromHex(effectStaticValue(effect, "keyColor"));
+  const similarity = clampUnit(numericEffectValue(effect, "similarity", frame, 35) / 100);
+  const smoothness = clampUnit(numericEffectValue(effect, "smoothness", frame, 12) / 100);
+  const spillAmount = clampUnit(numericEffectValue(effect, "spillSuppression", frame, 50) / 100);
+  const showMatte = booleanEffectValue(effect, "showMatte", false);
+
+  // Comparing normalized (unit-length) color vectors instead of raw RGB makes the key
+  // tolerant of the brightness/shadow variation real green-screen footage always has -
+  // a pixel that's a darker or lighter shade of the same key hue still reads as "close".
+  const keyLength = Math.sqrt(kr * kr + kg * kg + kb * kb) || 1;
+  const nkr = kr / keyLength;
+  const nkg = kg / keyLength;
+  const nkb = kb / keyLength;
+  const dominantIndex: 0 | 1 | 2 = kr >= kg && kr >= kb ? 0 : kg >= kb ? 1 : 2;
+
+  const maxDistance = 1.35;
+  const cutoff = maxDistance * similarity;
+  const halfRange = Math.max(0.01, maxDistance * smoothness * 0.6 + 0.02);
+  const edge0 = Math.max(0, cutoff - halfRange);
+  const edge1 = cutoff + halfRange;
+  const edgeSpan = Math.max(0.0001, edge1 - edge0);
+
+  const processed = imageDataCanvas(source, (data) => {
+    for (let index = 0; index < data.length; index += 4) {
+      const r = data[index];
+      const g = data[index + 1];
+      const b = data[index + 2];
+      const alpha = data[index + 3];
+
+      const length = Math.sqrt(r * r + g * g + b * b) || 1;
+      const distance = Math.sqrt((r / length - nkr) ** 2 + (g / length - nkg) ** 2 + (b / length - nkb) ** 2);
+
+      const t = clampUnit((distance - edge0) / edgeSpan);
+      const keyAlpha = t * t * (3 - 2 * t); // smoothstep: soft, not-jagged cutout edge
+
+      if (showMatte) {
+        const gray = clampByte(keyAlpha * 255);
+        data[index] = gray;
+        data[index + 1] = gray;
+        data[index + 2] = gray;
+        data[index + 3] = 255;
+        continue;
+      }
+
+      const [nextR, nextG, nextB] = keyAlpha > 0 ? suppressChromaSpill(r, g, b, dominantIndex, spillAmount) : [r, g, b];
+      data[index] = clampByte(nextR);
+      data[index + 1] = clampByte(nextG);
+      data[index + 2] = clampByte(nextB);
+      data[index + 3] = clampByte(alpha * keyAlpha);
+    }
+  });
+
+  return blendWithOriginal(source, processed, mix);
+}
+
 function applyEffectCanvas(source: HTMLCanvasElement, effect: Effect, frame: number) {
   if (effect.enabled === false) return source;
   if (effect.type === "colorGrading") return applyColorGradingShader(source, effect, frame);
@@ -1147,6 +1223,7 @@ function applyEffectCanvas(source: HTMLCanvasElement, effect: Effect, frame: num
   if (effect.type === "glow") return glowCanvas(source, effect, frame);
   if (effect.type === "noiseGrain") return noiseCanvas(source, effect, frame);
   if (effect.type === "sharpen") return sharpenCanvas(source, effect, frame);
+  if (effect.type === "chromaKey") return chromaKeyCanvas(source, effect, frame);
   return source;
 }
 
@@ -1245,6 +1322,23 @@ function applyAdjustmentLayerMask(
   return output;
 }
 
+// The single point where a layer's fully rendered (masked + effected) content actually
+// lands on the shared composition canvas, on top of whatever layers beneath it already
+// drew. Blend mode only ever needs to apply right here - every canvas 2D compositeOperation
+// value maps 1:1 to a Photoshop/AE blend mode name (see lib/blendModes.ts), so this is a
+// plain drawImage with the operation swapped in and restored afterward.
+function drawLayerCompositeResult(context: CanvasRenderingContext2D, layer: Layer, canvas: HTMLCanvasElement, dx: number, dy: number) {
+  const operation = compositeOperationForBlendMode(layer.blendMode);
+  if (operation === "source-over") {
+    context.drawImage(canvas, dx, dy);
+    return;
+  }
+  context.save();
+  context.globalCompositeOperation = operation;
+  context.drawImage(canvas, dx, dy);
+  context.restore();
+}
+
 function drawMaskedLayerContent(
   context: CanvasRenderingContext2D,
   composition: Composition,
@@ -1276,7 +1370,7 @@ function drawMaskedLayerContent(
     const maskContext = maskCanvas.getContext("2d");
 
     if (!maskContext) {
-      context.drawImage(applyLayerEffects(contentCanvas, layer, frame), -effectPadding, -effectPadding);
+      drawLayerCompositeResult(context, layer, applyLayerEffects(contentCanvas, layer, frame), -effectPadding, -effectPadding);
       return;
     }
 
@@ -1306,7 +1400,7 @@ function drawMaskedLayerContent(
     contentContext.globalCompositeOperation = "source-over";
   }
 
-  context.drawImage(applyLayerEffects(contentCanvas, layer, frame), -effectPadding, -effectPadding);
+  drawLayerCompositeResult(context, layer, applyLayerEffects(contentCanvas, layer, frame), -effectPadding, -effectPadding);
 }
 function drawMaskOutlines(context: CanvasRenderingContext2D, layer: Layer, frame: number, selectedMaskId?: string) {
   layer.masks.forEach((mask) => {

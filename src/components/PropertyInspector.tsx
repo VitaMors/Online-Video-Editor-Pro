@@ -1,9 +1,10 @@
 import { ChevronDown, ChevronUp, Clock3, Copy, Diamond, Link2, Link2Off, PanelRightClose, PanelRightOpen, Power, RotateCcw, SkipBack, SkipForward, Trash2 } from "lucide-react";
 import { Fragment, useEffect, useRef, useState } from "react";
 import { evaluatePathProperty, evaluateProperty, propertyLabel } from "../lib/animation";
+import { BLEND_MODE_LABELS, BLEND_MODE_ORDER } from "../lib/blendModes";
 import { effectControlDefinition, effectDefinition, effectNumberValue, effectStaticValue, isEffectNumberControl } from "../lib/effects";
 import { useEditorStore } from "../store/editorStore";
-import type { AnimatableProperty, AnimatableValue, EasePreset, Effect, EffectPropertyKey, Keyframe, Mask, MaskPropertyKey, SpatialVector, TransformPropertyKey } from "../types/editor";
+import type { AnimatableProperty, AnimatableValue, BlendMode, EasePreset, Effect, EffectPropertyKey, Keyframe, Mask, MaskPropertyKey, SpatialVector, TransformPropertyKey } from "../types/editor";
 
 const rows: TransformPropertyKey[] = ["position", "scale", "rotation", "opacity", "anchorPoint"];
 const threeDRows: TransformPropertyKey[] = ["position", "scale", "rotationX", "rotationY", "rotation", "opacity", "anchorPoint"];
@@ -217,6 +218,7 @@ export function PropertyInspector({ collapsed = false, mobile = false, onToggleC
   const updateMaskValue = useEditorStore((state) => state.updateMaskValue);
   const toggleMaskAnimation = useEditorStore((state) => state.toggleMaskAnimation);
   const addOrUpdateMaskKeyframe = useEditorStore((state) => state.addOrUpdateMaskKeyframe);
+  const setLayerBlendMode = useEditorStore((state) => state.setLayerBlendMode);
   const layer = composition?.layers.find((item) => item.id === selectedLayerIds[0]);
   const selectedPropertyState = layer?.transform[selectedProperty];
   const selectedTimeRemapProperty = selectedSourceProperty === "timeRemap" ? layer?.source?.timeRemap : undefined;
@@ -442,6 +444,22 @@ export function PropertyInspector({ collapsed = false, mobile = false, onToggleC
     <aside className={inspectorShellClass}>
       <InspectorHeader title={layer.name} onToggleCollapsed={headerToggle} />
       <div className="min-h-0 flex-1 overflow-y-auto">
+        {layer.type !== "audio" && layer.type !== "null" ? (
+          <section className="border-b panel-divider px-4 py-3">
+            <label className="block text-[12px] text-editor-muted">Blend Mode
+              <select
+                className="select-field mt-1 w-full"
+                title="How this layer's rendered pixels combine with the layers beneath it."
+                value={layer.blendMode}
+                onChange={(event) => setLayerBlendMode(layer.id, event.currentTarget.value as BlendMode)}
+              >
+                {BLEND_MODE_ORDER.map((mode) => (
+                  <option key={mode} value={mode}>{BLEND_MODE_LABELS[mode]}</option>
+                ))}
+              </select>
+            </label>
+          </section>
+        ) : null}
         <section ref={transformSectionRef} className="border-b panel-divider">
           <div className="flex h-10 items-center gap-2 px-4 text-[13px] font-semibold text-editor-ink">
             <ChevronDown size={15} /> Transform

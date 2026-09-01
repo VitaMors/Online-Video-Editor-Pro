@@ -56,8 +56,30 @@ export type EffectType =
   | "glow"
   | "noiseGrain"
   | "sharpen"
-  | "invert";
+  | "invert"
+  | "chromaKey";
 export type EffectPropertyKey = string;
+
+// Matches the canvas 2D globalCompositeOperation values 1:1 (plus "add", mapped to the
+// native "lighter" operation), so applying a blend mode never needs custom pixel math.
+export type BlendMode =
+  | "normal"
+  | "darken"
+  | "multiply"
+  | "colorBurn"
+  | "lighten"
+  | "screen"
+  | "colorDodge"
+  | "add"
+  | "overlay"
+  | "softLight"
+  | "hardLight"
+  | "difference"
+  | "exclusion"
+  | "hue"
+  | "saturation"
+  | "color"
+  | "luminosity";
 
 export type Mask = {
   id: string;
@@ -111,7 +133,7 @@ export type Layer = {
   startFrame: number;
   endFrame: number;
   parentId?: string;
-  blendMode: "normal";
+  blendMode: BlendMode;
   transform: TransformProperties;
   masks: Mask[];
   effects: Effect[];

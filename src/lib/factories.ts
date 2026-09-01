@@ -128,7 +128,7 @@ export function createLayer(
     startFrame: overrides.startFrame ?? 0,
     endFrame: overrides.endFrame ?? composition.durationFrames,
     parentId: overrides.parentId,
-    blendMode: "normal",
+    blendMode: overrides.blendMode ?? "normal",
     transform:
       overrides.transform ??
       createTransform(defaultPosition, defaultSize),
