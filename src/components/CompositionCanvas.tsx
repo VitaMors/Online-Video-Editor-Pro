@@ -2178,6 +2178,25 @@ async function exportCompositionVideo(
   const progressStep = Math.max(1, Math.round(outputFps / 4));
   let cancelled = false;
 
+  // Audio is captured live from real-time media playback, so its recorded length tracks
+  // however long this loop actually takes to run - not the composition's configured
+  // duration. Normally those match because the delay below paces the loop to real time,
+  // but if a single frame ever takes longer to prepare than its time budget (a slow video
+  // seek being the main offender - see prepareVideosForExportFrame/seekVideoForExport,
+  // which can block for up to 1.2s per frame on some source footage), the loop simply runs
+  // behind and audio keeps recording for every extra second that takes. Previously that
+  // meant a stalled seek could silently balloon the exported file to many times the
+  // composition's length, with the video frozen on its last frame for the overrun (the
+  // video track itself always stays exactly outputFrameCount/outputFps long, since
+  // CanvasSource.add() below is given exact timestamps regardless of loop pacing). This
+  // timer hard-caps captured audio to the intended output duration independent of how
+  // long the frame loop takes, so a slow seek can only make the export take longer in
+  // wall-clock time - it can no longer make the exported file itself longer.
+  const targetOutputSeconds = outputFrameCount / outputFps;
+  const audioCutoffTimer = audioSource
+    ? window.setTimeout(() => audioSource.pause(), Math.round(targetOutputSeconds * 1000))
+    : undefined;
+
   try {
     for (let outFrame = 0; outFrame < outputFrameCount; outFrame += 1) {
       // Nearest-frame resampling from output-timeline seconds back to a composition frame
@@ -2217,6 +2236,8 @@ async function exportCompositionVideo(
     await output.cancel().catch(() => undefined);
     throw error;
   } finally {
+    if (audioCutoffTimer !== undefined) window.clearTimeout(audioCutoffTimer);
+    audioSource?.pause();
     videos.forEach((video) => video.pause());
     audios.forEach((audio) => audio.pause());
     audioGraph?.tappedNodes.forEach((node) => {
