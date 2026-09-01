@@ -1944,6 +1944,7 @@ async function prepareAudioLayersForExportFrame(
   composition: Composition,
   frame: number,
   audios: Map<string, HTMLAudioElement>,
+  startedLayers: Set<string>,
 ) {
   const soloActive = composition.layers.some((layer) => layer.solo);
   const fps = finiteNumber(composition.fps, 30);
@@ -1956,13 +1957,20 @@ async function prepareAudioLayersForExportFrame(
 
     if (!audioLayerActiveAtFrame(layer, frame, soloActive)) {
       if (!audio.paused) audio.pause();
+      // Pausing here means a later reactivation is a fresh start, not a continuation - drop
+      // it so that frame gets an actual resync seek instead of being trusted like ongoing
+      // continuous playback (see CONTINUOUS_DRIFT_TOLERANCE above).
+      startedLayers.delete(layer.id);
       return;
     }
 
     const duration = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0;
     const targetTime = mediaTimeForFrame(layer, frame, fps, duration);
-    if (audio.readyState < 2 || Math.abs(audio.currentTime - targetTime) > 0.2) {
+    const alreadyStarted = startedLayers.has(layer.id);
+    const needsSeek = !alreadyStarted || Math.abs(audio.currentTime - targetTime) > CONTINUOUS_DRIFT_TOLERANCE;
+    if (needsSeek) {
       await seekVideoForExport(audio, targetTime, 0.06);
+      startedLayers.add(layer.id);
     }
 
     audio.playbackRate = 1;
@@ -2045,10 +2053,25 @@ function buildExportAudioGraph(composition: Composition, videos: Map<string, HTM
   return { audioContext, destination, tappedNodes };
 }
 
+// Once a video/audio layer's element is up and playing, it advances on its own in real time
+// and stays naturally in sync with each frame's target time - it does NOT need correcting
+// every frame. Poking `.currentTime` on an already-playing element (even just to "fix" a few
+// hundred ms of completely expected per-frame processing jitter) forces the browser to
+// interrupt decode and re-buffer, which drops its readyState back down; if the next frame's
+// check runs before that recovers, it reads as "still not ready" and seeks *again* before the
+// previous seek ever really settled. That created a self-reinforcing seek -> stall -> "needs
+// another seek" cycle that, once started, never let a single frame decode from smooth,
+// continuous playback - every captured frame was grabbed moments after a disruptive re-seek
+// instead, which is what produced the choppy/stuttering exports. So a layer already playing
+// is left alone unless it has drifted by a real amount (e.g. it sat inactive for a gap and
+// needs resyncing) - not on every routine readyState flicker.
+const CONTINUOUS_DRIFT_TOLERANCE = 1;
+
 async function prepareVideosForExportFrame(
   composition: Composition,
   frame: number,
   videos: Map<string, HTMLVideoElement>,
+  startedLayers: Set<string>,
 ) {
   const soloActive = composition.layers.some((layer) => layer.solo);
   const fps = finiteNumber(composition.fps, 30);
@@ -2068,8 +2091,11 @@ async function prepareVideosForExportFrame(
       return;
     }
 
-    if (video.readyState < 2 || Math.abs(video.currentTime - targetTime) > 0.28) {
+    const alreadyStarted = startedLayers.has(layer.id);
+    const needsSeek = !alreadyStarted || Math.abs(video.currentTime - targetTime) > CONTINUOUS_DRIFT_TOLERANCE;
+    if (needsSeek) {
       await seekVideoForExport(video, targetTime, 0.08);
+      startedLayers.add(layer.id);
     }
 
     video.muted = true;
@@ -2197,14 +2223,19 @@ async function exportCompositionVideo(
     ? window.setTimeout(() => audioSource.pause(), Math.round(targetOutputSeconds * 1000))
     : undefined;
 
+  // Tracks which layers' media elements have already been started (seeked once + playing)
+  // this export, so later frames trust their continuous real-time playback instead of
+  // re-seeking every frame - see the comment on CONTINUOUS_DRIFT_TOLERANCE above.
+  const startedMediaLayers = new Set<string>();
+
   try {
     for (let outFrame = 0; outFrame < outputFrameCount; outFrame += 1) {
       // Nearest-frame resampling from output-timeline seconds back to a composition frame
       // number. When outputFps === compositionFps this reduces to `frame = outFrame` exactly.
       const frame = Math.min(durationFrames - 1, Math.round((outFrame / outputFps) * compositionFps));
       await Promise.all([
-        prepareVideosForExportFrame(composition, frame, videos),
-        prepareAudioLayersForExportFrame(composition, frame, audios),
+        prepareVideosForExportFrame(composition, frame, videos, startedMediaLayers),
+        prepareAudioLayersForExportFrame(composition, frame, audios, startedMediaLayers),
       ]);
       renderCompositionFrame(exportContext, composition, frame, {
         images,
