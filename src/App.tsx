@@ -88,7 +88,19 @@ export default function App() {
       const elapsed = (time - lastTime) / 1000;
       lastTime = time;
       frameRemainder.current += elapsed * fps;
-      const wholeFrames = Math.floor(frameRemainder.current);
+      // Only ever step the playhead forward by ONE composition frame per tick, even if
+      // `elapsed` says several frames' worth of real time have passed. Composition frames
+      // with a lot of per-frame work (imported video plus several pixel-processing effects
+      // like curves/hue-saturation/sharpen, which each do a synchronous getImageData pass)
+      // can easily take longer to render than the nominal 1000/fps budget - previously,
+      // that made the NEXT tick's `elapsed` large, so wholeFrames jumped by several frames
+      // at once to "catch up" to real time, which meant those in-between frames were never
+      // rendered at all. That's what produced the choppy playback and the sense that frames
+      // were being skipped/missing: they genuinely were. Any leftover accumulated time stays
+      // in frameRemainder and keeps advancing the playhead one frame at a time on
+      // subsequent ticks, so heavy stretches make playback run slower than real-time
+      // instead of dropping frames - every composition frame still gets rendered, in order.
+      const wholeFrames = Math.min(1, Math.floor(frameRemainder.current));
       if (wholeFrames > 0) {
         frameRemainder.current -= wholeFrames;
         const nextFrame = playheadFrameRef.current + wholeFrames;

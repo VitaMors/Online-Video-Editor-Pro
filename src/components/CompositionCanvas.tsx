@@ -2297,6 +2297,21 @@ export function CompositionCanvas() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const textInputRef = useRef<HTMLInputElement | null>(null);
+  // Video/audio elements are never shown directly - they only ever get read from via
+  // drawImage()/Web Audio taps - so they used to just live in memory, never attached to the
+  // document. Chrome (and Chromium/Electron) is free to throttle or outright stop decoding
+  // video frames for a <video> that was never inserted into the DOM, especially once it's
+  // been playing a little while; the element's `currentTime` can keep ticking upward the
+  // whole time even after decode has actually stalled, so the drift-based resync checks
+  // elsewhere never notice anything is wrong (the reported time is "correct") while the
+  // actual pixels drawImage() reads stay frozen on whatever frame decoding stopped on. That
+  // silent stall - not a seeking bug - is what was producing playback (and, since export
+  // reuses these same cached elements, exported video) that looked fine for the first
+  // second or so and then froze/went choppy indefinitely. Keeping every video/audio element
+  // attached here (invisible, zero footprint, but genuinely part of the document) keeps
+  // Chrome treating them as live, continuously-decoding media instead of background/detached
+  // ones eligible for that throttling.
+  const mediaHostRef = useRef<HTMLDivElement | null>(null);
   const imageCache = useRef(new Map<string, HTMLImageElement>());
   const videoCache = useRef(new Map<string, HTMLVideoElement>());
   const audioCache = useRef(new Map<string, HTMLAudioElement>());
@@ -2473,6 +2488,7 @@ export function CompositionCanvas() {
           });
         });
         video.load();
+        mediaHostRef.current?.appendChild(video);
         videoCache.current.set(videoUrl, video);
       }
 
@@ -2486,6 +2502,7 @@ export function CompositionCanvas() {
           audio.addEventListener(eventName, () => setMediaVersion((version) => version + 1));
         });
         audio.load();
+        mediaHostRef.current?.appendChild(audio);
         audioCache.current.set(audioUrl, audio);
       }
 
@@ -2654,6 +2671,9 @@ export function CompositionCanvas() {
 
   return (
     <div ref={wrapperRef} className="relative h-full min-h-0 min-w-0 overflow-hidden bg-[#090c10]">
+      {/* Real (but invisible) home for every video/audio element the composition uses - see
+          the comment on mediaHostRef above for why these can't just live off-DOM in memory. */}
+      <div ref={mediaHostRef} aria-hidden="true" style={{ position: "absolute", width: 1, height: 1, overflow: "hidden", opacity: 0.01, pointerEvents: "none" }} />
       <canvas
         ref={canvasRef}
         className={`h-full w-full ${activeTool === "mask" ? "cursor-crosshair" : "cursor-default"}`}
