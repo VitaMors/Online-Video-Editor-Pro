@@ -48,6 +48,55 @@ const videoFrameCache = new Map<string, CachedVideoFrame>();
 const modelCache = new Map<string, CachedModel>();
 const modelRenderCache = new Map<string, ModelRenderRuntime>();
 
+// Rendering a single frame (live preview or export) walks every layer through a tree of
+// masking/effects helpers that each need scratch canvases. Allocating a brand-new
+// HTMLCanvasElement for every one of those on every single frame (up to 60x/sec while
+// playing, or once per exported frame) is what made playback and export stutter - the
+// browser was constantly creating and garbage-collecting full-resolution canvases.
+// This pool hands out reusable canvases keyed by pixel size instead. Call
+// resetScratchCanvasPool() once at the top of a full frame render; every borrowScratchCanvas()
+// call during that render gets a cleared canvas, reusing previous frames' allocations
+// whenever the requested size repeats (the common case for a stable composition).
+type ScratchCanvasEntry = { canvas: HTMLCanvasElement; inUse: boolean };
+const scratchCanvasPool: ScratchCanvasEntry[] = [];
+const SCRATCH_CANVAS_POOL_CAP = 128;
+
+function resetScratchCanvasPool() {
+  scratchCanvasPool.forEach((entry) => {
+    entry.inUse = false;
+  });
+  if (scratchCanvasPool.length > SCRATCH_CANVAS_POOL_CAP) {
+    scratchCanvasPool.length = SCRATCH_CANVAS_POOL_CAP;
+  }
+}
+
+function borrowScratchCanvas(width: number, height: number) {
+  const pixelWidth = Math.max(1, Math.round(width));
+  const pixelHeight = Math.max(1, Math.round(height));
+  let entry = scratchCanvasPool.find((candidate) => !candidate.inUse && candidate.canvas.width === pixelWidth && candidate.canvas.height === pixelHeight);
+  if (!entry) {
+    const canvas = document.createElement("canvas");
+    canvas.width = pixelWidth;
+    canvas.height = pixelHeight;
+    entry = { canvas, inUse: false };
+    scratchCanvasPool.push(entry);
+  }
+  entry.inUse = true;
+  const context = entry.canvas.getContext("2d");
+  if (context) {
+    context.imageSmoothingEnabled = true;
+    context.imageSmoothingQuality = "high";
+    context.clearRect(0, 0, pixelWidth, pixelHeight);
+  }
+  return entry.canvas;
+}
+
+function configureHighQualityContext(context: CanvasRenderingContext2D | null | undefined) {
+  if (!context) return;
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = "high";
+}
+
 function shouldDrawLayer(layer: Layer, frame: number, soloActive: boolean) {
   if (layer.visible === false || layer.type === "null" || layer.type === "audio") return false;
   if (soloActive && !layer.solo) return false;
@@ -635,7 +684,10 @@ function drawLayerContent(
     const enoughPreviewBuffer = video ? hasEnoughPreviewBuffer(video, layer, frame, fps) : false;
     const playbackDriven = liveVideoPlayback && !source.timeRemap;
     if (video && !playbackDriven) syncVideoToFrame(video, layer, frame, fps);
-    if (video && video.readyState >= 2 && video.videoWidth > 0) {
+    // While a seek is in flight the video element still displays its pre-seek frame, so
+    // drawing it here would flash the wrong frame during scrubbing/timeline dragging.
+    // Prefer the last known-good cached frame until the seek actually resolves.
+    if (video && video.readyState >= 2 && video.videoWidth > 0 && !video.seeking) {
       try {
         context.drawImage(video, 0, 0, width, height);
         rememberVideoFrame(source.videoUrl, video, width, height);
@@ -721,10 +773,7 @@ function hslToRgb(hsl: [number, number, number]): [number, number, number] {
 }
 
 function canvasLike(source: HTMLCanvasElement) {
-  const canvas = document.createElement("canvas");
-  canvas.width = source.width;
-  canvas.height = source.height;
-  return canvas;
+  return borrowScratchCanvas(source.width, source.height);
 }
 
 function filteredCanvas(source: HTMLCanvasElement, filter: string) {
@@ -1156,9 +1205,7 @@ function applyAdjustmentLayerMask(
 
   const width = original.width;
   const height = original.height;
-  const maskCanvas = document.createElement("canvas");
-  maskCanvas.width = width;
-  maskCanvas.height = height;
+  const maskCanvas = borrowScratchCanvas(width, height);
   const maskContext = maskCanvas.getContext("2d");
   if (!maskContext) return adjusted;
 
@@ -1182,9 +1229,7 @@ function applyAdjustmentLayerMask(
     maskContext.restore();
   });
 
-  const maskedAdjusted = document.createElement("canvas");
-  maskedAdjusted.width = width;
-  maskedAdjusted.height = height;
+  const maskedAdjusted = borrowScratchCanvas(width, height);
   const maskedContext = maskedAdjusted.getContext("2d");
   if (!maskedContext) return adjusted;
   maskedContext.drawImage(adjusted, 0, 0, width, height);
@@ -1192,9 +1237,7 @@ function applyAdjustmentLayerMask(
   maskedContext.drawImage(maskCanvas, 0, 0);
   maskedContext.globalCompositeOperation = "source-over";
 
-  const output = document.createElement("canvas");
-  output.width = width;
-  output.height = height;
+  const output = borrowScratchCanvas(width, height);
   const outputContext = output.getContext("2d");
   if (!outputContext) return adjusted;
   outputContext.drawImage(original, 0, 0, width, height);
@@ -1215,9 +1258,7 @@ function drawMaskedLayerContent(
 ) {
   const [width, height] = getLayerSize(layer);
   const effectPadding = glowSpreadPadding(layer, frame);
-  const contentCanvas = document.createElement("canvas");
-  contentCanvas.width = Math.max(1, Math.ceil(width + effectPadding * 2));
-  contentCanvas.height = Math.max(1, Math.ceil(height + effectPadding * 2));
+  const contentCanvas = borrowScratchCanvas(Math.ceil(width + effectPadding * 2), Math.ceil(height + effectPadding * 2));
   const contentContext = contentCanvas.getContext("2d");
 
   if (!contentContext) {
@@ -1231,9 +1272,7 @@ function drawMaskedLayerContent(
   contentContext.restore();
 
   if (layer.masks.length > 0) {
-    const maskCanvas = document.createElement("canvas");
-    maskCanvas.width = contentCanvas.width;
-    maskCanvas.height = contentCanvas.height;
+    const maskCanvas = borrowScratchCanvas(contentCanvas.width, contentCanvas.height);
     const maskContext = maskCanvas.getContext("2d");
 
     if (!maskContext) {
@@ -1487,6 +1526,13 @@ function renderCompositionFrame(
   const selectedLayerIds = options.selectedLayerIds ?? [];
   const showBounds = options.showBounds ?? false;
 
+  // Every masked/effected layer below borrows scratch canvases from the shared pool.
+  // Resetting here (once per full frame render, whether live preview or export) lets
+  // those canvases be reused frame-to-frame instead of reallocated, which is what was
+  // causing playback and export to stutter under load.
+  resetScratchCanvasPool();
+  configureHighQualityContext(context);
+
   context.clearRect(0, 0, composition.width, composition.height);
   if (composition.backgroundTransparent) {
     if (options.showTransparencyGrid) drawTransparencyGrid(context, composition);
@@ -1503,9 +1549,7 @@ function renderCompositionFrame(
     .slice()
     .reverse()
     .filter((layer) => shouldDrawLayer(layer, frame, soloActive));
-  const contentCanvas = document.createElement("canvas");
-  contentCanvas.width = Math.max(1, Math.round(composition.width));
-  contentCanvas.height = Math.max(1, Math.round(composition.height));
+  const contentCanvas = borrowScratchCanvas(composition.width, composition.height);
   const contentContext = contentCanvas.getContext("2d");
 
   if (contentContext) {
@@ -1634,8 +1678,11 @@ function downloadVideoBlob(blob: Blob, filename: string) {
 function bestVideoRecorderMimeType() {
   if (typeof MediaRecorder === "undefined") return "";
   return [
+    "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
     "video/mp4;codecs=avc1.42E01E",
     "video/mp4",
+    "video/webm;codecs=vp9,opus",
+    "video/webm;codecs=vp8,opus",
     "video/webm;codecs=vp9",
     "video/webm;codecs=vp8",
     "video/webm",
@@ -1685,24 +1732,24 @@ function waitForMediaMetadataForExport(media: HTMLMediaElement) {
   });
 }
 
-async function seekVideoForExport(video: HTMLVideoElement, time: number, tolerance = 0.045) {
-  await waitForMediaMetadataForExport(video);
-  if (Math.abs(video.currentTime - time) <= tolerance && video.readyState >= 2) return;
+async function seekVideoForExport(media: HTMLMediaElement, time: number, tolerance = 0.045) {
+  await waitForMediaMetadataForExport(media);
+  if (Math.abs(media.currentTime - time) <= tolerance && media.readyState >= 2) return;
 
   await new Promise<void>((resolve) => {
     let settled = false;
     const finish = () => {
       if (settled) return;
       settled = true;
-      video.removeEventListener("seeked", finish);
-      video.removeEventListener("loadeddata", finish);
-      video.removeEventListener("error", finish);
+      media.removeEventListener("seeked", finish);
+      media.removeEventListener("loadeddata", finish);
+      media.removeEventListener("error", finish);
       resolve();
     };
-    video.addEventListener("seeked", finish, { once: true });
-    video.addEventListener("loadeddata", finish, { once: true });
-    video.addEventListener("error", finish, { once: true });
-    safeSeekMedia(video, time);
+    media.addEventListener("seeked", finish, { once: true });
+    media.addEventListener("loadeddata", finish, { once: true });
+    media.addEventListener("error", finish, { once: true });
+    safeSeekMedia(media, time);
     window.setTimeout(finish, 1200);
   });
 }
@@ -1715,6 +1762,7 @@ async function waitForExportAssets(
   composition: Composition,
   images: Map<string, HTMLImageElement>,
   videos: Map<string, HTMLVideoElement>,
+  audios: Map<string, HTMLAudioElement>,
 ) {
   const imageTasks = composition.layers
     .map((layer) => layer.source?.imageUrl ? images.get(layer.source.imageUrl) : undefined)
@@ -1724,11 +1772,127 @@ async function waitForExportAssets(
     .map((layer) => layer.source?.videoUrl ? videos.get(layer.source.videoUrl) : undefined)
     .filter((video): video is HTMLVideoElement => Boolean(video))
     .map(waitForMediaMetadataForExport);
+  const audioTasks = composition.layers
+    .map((layer) => layer.source?.audioUrl ? audios.get(layer.source.audioUrl) : undefined)
+    .filter((audio): audio is HTMLAudioElement => Boolean(audio))
+    .map(waitForMediaMetadataForExport);
   const modelTasks = composition.layers
     .map((layer) => layer.source?.modelUrl)
     .filter((modelUrl): modelUrl is string => Boolean(modelUrl))
     .map(waitForModelForExport);
-  await Promise.all([...imageTasks, ...videoTasks, ...modelTasks]);
+  await Promise.all([...imageTasks, ...videoTasks, ...audioTasks, ...modelTasks]);
+}
+
+function audioLayerActiveAtFrame(layer: Layer, frame: number, soloActive: boolean) {
+  return layer.visible !== false && (!soloActive || layer.solo) && frame >= layer.startFrame && frame < layer.endFrame;
+}
+
+// Dedicated audio layers aren't drawn (shouldDrawLayer excludes them), but the export
+// recording needs them played and paused in lockstep with the composition frame just like
+// video layers, so their sound lands at the right point in the exported timeline.
+async function prepareAudioLayersForExportFrame(
+  composition: Composition,
+  frame: number,
+  audios: Map<string, HTMLAudioElement>,
+) {
+  const soloActive = composition.layers.some((layer) => layer.solo);
+  const fps = finiteNumber(composition.fps, 30);
+
+  await Promise.all(composition.layers.map(async (layer) => {
+    const audioUrl = layer.source?.audioUrl;
+    if (!audioUrl) return;
+    const audio = audios.get(audioUrl);
+    if (!audio) return;
+
+    if (!audioLayerActiveAtFrame(layer, frame, soloActive)) {
+      if (!audio.paused) audio.pause();
+      return;
+    }
+
+    const duration = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0;
+    const targetTime = mediaTimeForFrame(layer, frame, fps, duration);
+    if (audio.readyState < 2 || Math.abs(audio.currentTime - targetTime) > 0.2) {
+      await seekVideoForExport(audio, targetTime, 0.06);
+    }
+
+    audio.playbackRate = 1;
+    if (audio.paused) await audio.play().catch(() => undefined);
+  }));
+}
+
+// MediaRecorder can only capture audio from a MediaStream, and canvas.captureStream()
+// only ever carries video. The video/audio elements that play live during export need to
+// be routed through the Web Audio API into a MediaStreamAudioDestinationNode so their
+// sound reaches the recorder at all - previously nothing did this, so every exported
+// video was silent regardless of how much audio was in the timeline.
+//
+// A given HTMLMediaElement can only ever be tapped by createMediaElementSource() once in
+// its lifetime, and doing so reroutes its audio output through the Web Audio graph from
+// then on. These elements are cached and reused across exports (and for live preview), so
+// each node is created at most once and always reconnected back to the real audio
+// destination - that keeps normal playback sounding exactly as it did before it was ever
+// tapped, on this export and any future one.
+const exportAudioSourceNodes = new WeakMap<HTMLMediaElement, MediaElementAudioSourceNode>();
+let exportAudioContext: AudioContext | null = null;
+
+function getExportAudioContext(): AudioContext | null {
+  const Ctor = typeof window !== "undefined" ? window.AudioContext : undefined;
+  if (!Ctor) return null;
+  if (!exportAudioContext || exportAudioContext.state === "closed") {
+    exportAudioContext = new Ctor();
+  }
+  return exportAudioContext;
+}
+
+function tapMediaElementForExportAudio(
+  audioContext: AudioContext,
+  destination: MediaStreamAudioDestinationNode,
+  element: HTMLMediaElement,
+) {
+  let node = exportAudioSourceNodes.get(element);
+  if (!node) {
+    try {
+      node = audioContext.createMediaElementSource(element);
+    } catch {
+      // Cross-origin media without CORS clearance can't be tapped by Web Audio; the
+      // export continues picture-only for that layer rather than failing outright.
+      return undefined;
+    }
+    exportAudioSourceNodes.set(element, node);
+    node.connect(audioContext.destination);
+  }
+  node.connect(destination);
+  return node;
+}
+
+function buildExportAudioGraph(composition: Composition, videos: Map<string, HTMLVideoElement>, audios: Map<string, HTMLAudioElement>) {
+  const audioContext = getExportAudioContext();
+  if (!audioContext) return undefined;
+
+  const destination = audioContext.createMediaStreamDestination();
+  const tappedNodes: MediaElementAudioSourceNode[] = [];
+
+  composition.layers.forEach((layer) => {
+    if (layer.type === "audio" && layer.source?.audioUrl) {
+      const audio = audios.get(layer.source.audioUrl);
+      if (audio) {
+        const node = tapMediaElementForExportAudio(audioContext, destination, audio);
+        if (node) tappedNodes.push(node);
+      }
+    }
+
+    // Time-remapped video is paused and seeked frame-by-frame for picture accuracy, so
+    // it never plays in real time and has no meaningful audio to capture here.
+    if (layer.type === "video" && layer.source?.videoUrl && !layer.source.timeRemap) {
+      const video = videos.get(layer.source.videoUrl);
+      if (video) {
+        const node = tapMediaElementForExportAudio(audioContext, destination, video);
+        if (node) tappedNodes.push(node);
+      }
+    }
+  });
+
+  return { audioContext, destination, tappedNodes };
 }
 
 async function prepareVideosForExportFrame(
@@ -1768,6 +1932,7 @@ async function exportCompositionVideo(
   composition: Composition,
   images: Map<string, HTMLImageElement>,
   videos: Map<string, HTMLVideoElement>,
+  audios: Map<string, HTMLAudioElement>,
   filename?: string,
 ) {
   if (!("captureStream" in HTMLCanvasElement.prototype)) {
@@ -1777,7 +1942,7 @@ async function exportCompositionVideo(
   const mimeType = bestVideoRecorderMimeType();
   if (!mimeType) throw new Error("This browser does not expose a supported video recorder.");
 
-  await waitForExportAssets(composition, images, videos);
+  await waitForExportAssets(composition, images, videos, audios);
 
   const fps = Math.max(1, Math.min(60, finiteNumber(composition.fps, 30)));
   const durationFrames = Math.max(1, Math.round(finiteNumber(composition.durationFrames, fps * 10)));
@@ -1787,8 +1952,24 @@ async function exportCompositionVideo(
   const exportContext = exportCanvas.getContext("2d");
   if (!exportContext) throw new Error("Could not create video export canvas.");
 
-  const stream = exportCanvas.captureStream(fps);
-  const videoTrack = stream.getVideoTracks()[0] as CanvasCaptureMediaStreamTrack | undefined;
+  // Passing 0 here puts the canvas track in manual-capture mode: it only ever produces a
+  // frame when requestFrame() is called below. Passing `fps` instead (the previous
+  // behavior) makes the browser ALSO auto-capture on its own timer in parallel with the
+  // manual calls, so the recorder receives roughly double the intended frame rate with
+  // irregular spacing between them - that mismatch was a direct cause of the stutter/
+  // frame-skipping artifacts in exported video.
+  const canvasStream = exportCanvas.captureStream(0);
+  const videoTrack = canvasStream.getVideoTracks()[0] as CanvasCaptureMediaStreamTrack | undefined;
+
+  const audioGraph = buildExportAudioGraph(composition, videos, audios);
+  if (audioGraph?.audioContext.state === "suspended") {
+    await audioGraph.audioContext.resume().catch(() => undefined);
+  }
+
+  const stream = new MediaStream();
+  if (videoTrack) stream.addTrack(videoTrack);
+  audioGraph?.destination.stream.getAudioTracks().forEach((track) => stream.addTrack(track));
+
   const chunks: Blob[] = [];
   const recorder = new MediaRecorder(stream, {
     mimeType,
@@ -1806,33 +1987,47 @@ async function exportCompositionVideo(
   const startedAt = performance.now();
   const progressStep = Math.max(1, Math.round(fps));
 
-  for (let frame = 0; frame < durationFrames; frame += 1) {
-    await prepareVideosForExportFrame(composition, frame, videos);
-    renderCompositionFrame(exportContext, composition, frame, {
-      images,
-      videos,
-      includeOverlays: false,
-      showGrid: false,
-      showGuides: false,
-      showBounds: false,
-      showTransparencyGrid: false,
-      liveVideoPlayback: true,
-    });
-    videoTrack?.requestFrame();
+  try {
+    for (let frame = 0; frame < durationFrames; frame += 1) {
+      await Promise.all([
+        prepareVideosForExportFrame(composition, frame, videos),
+        prepareAudioLayersForExportFrame(composition, frame, audios),
+      ]);
+      renderCompositionFrame(exportContext, composition, frame, {
+        images,
+        videos,
+        includeOverlays: false,
+        showGrid: false,
+        showGuides: false,
+        showBounds: false,
+        showTransparencyGrid: false,
+        liveVideoPlayback: true,
+      });
+      videoTrack?.requestFrame();
 
-    if (frame === 0 || frame % progressStep === 0) {
-      const percent = Math.min(100, Math.round(((frame + 1) / durationFrames) * 100));
-      emitVideoExportStatus(`Rendering video ${percent}%`);
+      if (frame === 0 || frame % progressStep === 0) {
+        const percent = Math.min(100, Math.round(((frame + 1) / durationFrames) * 100));
+        emitVideoExportStatus(`Rendering video ${percent}%`);
+      }
+
+      const nextFrameDueAt = startedAt + ((frame + 1) / fps) * 1000;
+      await waitForExportDelay(nextFrameDueAt - performance.now());
     }
-
-    const nextFrameDueAt = startedAt + ((frame + 1) / fps) * 1000;
-    await waitForExportDelay(nextFrameDueAt - performance.now());
+  } finally {
+    if (recorder.state !== "inactive") recorder.stop();
+    videos.forEach((video) => video.pause());
+    audios.forEach((audio) => audio.pause());
+    audioGraph?.tappedNodes.forEach((node) => {
+      try {
+        node.disconnect(audioGraph.destination);
+      } catch {
+        // Already disconnected (e.g. export threw before the graph fully wired up).
+      }
+    });
   }
 
-  if (recorder.state !== "inactive") recorder.stop();
   const blob = await stopped;
   stream.getTracks().forEach((track) => track.stop());
-  videos.forEach((video) => video.pause());
 
   const extension = extensionForRecorderMimeType(mimeType);
   downloadVideoBlob(blob, `${videoExportFileBaseName(filename ?? composition.name)}.${extension}`);
@@ -1888,14 +2083,17 @@ export function CompositionCanvas() {
 
       exportInProgressRef.current = true;
       emitVideoExportStatus("Rendering video 0%");
-      void exportCompositionVideo(composition, imageCache.current, videoCache.current, detail.filename)
+      void exportCompositionVideo(composition, imageCache.current, videoCache.current, audioCache.current, detail.filename)
         .catch((error: unknown) => {
           const message = error instanceof Error ? error.message : "Video export failed.";
           emitVideoExportStatus(message);
         })
         .finally(() => {
           exportInProgressRef.current = false;
-          if (!useEditorStore.getState().isPlaying) videoCache.current.forEach((video) => video.pause());
+          if (!useEditorStore.getState().isPlaying) {
+            videoCache.current.forEach((video) => video.pause());
+            audioCache.current.forEach((audio) => audio.pause());
+          }
         });
     };
 
