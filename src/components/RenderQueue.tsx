@@ -1,6 +1,7 @@
 import { ListVideo, Plus, Trash2, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import {
+  FPS_PRESETS,
   RESOLUTION_SCALE_PRESETS,
   VIDEO_EXPORT_CONTAINER_LABELS,
   VIDEO_EXPORT_QUALITY_LABELS,
@@ -46,7 +47,8 @@ function settingsSummary(settings: VideoExportSettings) {
   const resolutionLabel = RESOLUTION_SCALE_PRESETS.find((preset) => preset.value === settings.resolutionScale)?.label
     ?? `${Math.round(settings.resolutionScale * 100)}%`;
   const bitrate = settings.customBitrateMbps ? `${settings.customBitrateMbps} Mbps` : VIDEO_EXPORT_QUALITY_LABELS[settings.quality];
-  return `${VIDEO_EXPORT_CONTAINER_LABELS[settings.container]} · ${bitrate} · ${resolutionLabel} res`;
+  const fpsLabel = settings.fpsOverride ? `${settings.fpsOverride}fps` : "comp fps";
+  return `${VIDEO_EXPORT_CONTAINER_LABELS[settings.container]} · ${bitrate} · ${resolutionLabel} res · ${fpsLabel}`;
 }
 
 function statusLabel(job: RenderQueueJob) {
@@ -387,6 +389,42 @@ function OutputModuleSettingsDialog({
                 <option key={preset.value} value={preset.value}>{preset.label}</option>
               ))}
             </select>
+          </label>
+
+          <label className="grid grid-cols-[100px_minmax(0,1fr)] items-center gap-3">Frame Rate
+            <select
+              className="number-field text-left"
+              value={FPS_PRESETS.some((preset) => preset.value === (job.settings.fpsOverride ?? 0)) ? (job.settings.fpsOverride ?? 0) : "custom"}
+              onChange={(event) => {
+                const value = event.currentTarget.value;
+                if (value === "custom") return;
+                const numeric = Number(value);
+                onChange({ fpsOverride: numeric > 0 ? numeric : undefined });
+              }}
+            >
+              {FPS_PRESETS.map((preset) => (
+                <option key={preset.value} value={preset.value}>{preset.label}</option>
+              ))}
+              <option value="custom" disabled>Custom…</option>
+            </select>
+          </label>
+
+          <label className="grid grid-cols-[100px_minmax(0,1fr)] items-center gap-3">Custom FPS
+            <div className="flex items-center gap-2">
+              <input
+                className="number-field"
+                type="number"
+                min={1}
+                max={120}
+                placeholder="e.g. 23.976"
+                value={job.settings.fpsOverride ?? ""}
+                onChange={(event) => {
+                  const value = event.currentTarget.value;
+                  onChange({ fpsOverride: value === "" ? undefined : Math.max(1, Number(value)) });
+                }}
+              />
+              <span className="text-[11px] text-editor-muted">fps (overrides preset)</span>
+            </div>
           </label>
 
           <label className="grid grid-cols-[100px_minmax(0,1fr)] items-center gap-3">Custom Bitrate

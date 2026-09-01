@@ -4,10 +4,15 @@ import { GraphEditor } from "./components/GraphEditor";
 import { LayerPanel } from "./components/LayerPanel";
 import { MenuBar } from "./components/MenuBar";
 import { PropertyInspector } from "./components/PropertyInspector";
+import { PROJECT_OPENED_EVENT, RelinkMediaDialog } from "./components/RelinkMediaDialog";
 import { Timeline } from "./components/Timeline";
 import { Toolbar } from "./components/Toolbar";
 import { useEditorStore } from "./store/editorStore";
 import type { Project } from "./types/editor";
+
+function emitProjectOpened(project: Project) {
+  window.dispatchEvent(new CustomEvent(PROJECT_OPENED_EVENT, { detail: { project } }));
+}
 
 const assetUrl = (path: string) => `${import.meta.env.BASE_URL}${path}`;
 
@@ -142,6 +147,7 @@ export default function App() {
       if (!project) throw new Error("Invalid project file");
       replaceProject(project);
       setShowSplash(false);
+      emitProjectOpened(project);
     } catch {
       window.alert("That file does not look like a valid project file.");
     }
@@ -225,6 +231,7 @@ export default function App() {
           </div>
         </div>
       ) : null}
+      <RelinkMediaDialog />
     </div>
   );
 }

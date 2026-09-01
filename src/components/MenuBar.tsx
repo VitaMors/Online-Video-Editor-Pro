@@ -1,8 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { EFFECT_DEFINITIONS, EFFECT_ORDER } from "../lib/effects";
+import { PROJECT_OPENED_EVENT } from "./RelinkMediaDialog";
 import { RenderQueue } from "./RenderQueue";
 import { useEditorStore } from "../store/editorStore";
 import type { Composition, EditorTool, EffectType, LayerType, Project } from "../types/editor";
+
+function emitProjectOpened(project: Project) {
+  window.dispatchEvent(new CustomEvent(PROJECT_OPENED_EVENT, { detail: { project } }));
+}
 
 type MenuName = "File" | "Edit" | "Comp" | "Layer" | "Effects" | "Select";
 
@@ -325,6 +330,7 @@ export function MenuBar() {
       if (!nextProject) throw new Error("Invalid project file");
       replaceProject(nextProject);
       showNotice("Project opened");
+      emitProjectOpened(nextProject);
     } catch {
       window.alert("That file does not look like a valid project file.");
     }
@@ -337,6 +343,9 @@ export function MenuBar() {
       if (!composition) throw new Error("Invalid composition file");
       importComposition(composition);
       showNotice("Composition imported");
+      // The imported composition (not the whole project) is what might carry dead blob:
+      // media references from whatever session it was originally exported in.
+      emitProjectOpened({ id: composition.id, name: composition.name, compositions: [composition] });
     } catch {
       window.alert("That file does not look like a valid composition file.");
     }

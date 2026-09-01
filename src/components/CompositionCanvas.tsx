@@ -1839,14 +1839,13 @@ const VIDEO_QUALITY_BITRATE_FACTOR: Record<VideoExportSettings["quality"], numbe
   "very-high": 0.22,
 };
 
-function videoQualityForExport(composition: Composition, settings: VideoExportSettings, width: number, height: number): Quality {
+function videoQualityForExport(settings: VideoExportSettings, width: number, height: number, outputFps: number): Quality {
   if (settings.customBitrateMbps && settings.customBitrateMbps > 0) {
     return new Quality({ bitrate: Math.round(settings.customBitrateMbps * 1_000_000) });
   }
-  const fps = Math.max(1, Math.min(60, finiteNumber(composition.fps, 30)));
   const pixels = Math.max(1, width * height);
   const factor = VIDEO_QUALITY_BITRATE_FACTOR[settings.quality] ?? VIDEO_QUALITY_BITRATE_FACTOR.high;
-  const bitrate = Math.round(Math.min(50_000_000, Math.max(1_000_000, pixels * fps * factor)));
+  const bitrate = Math.round(Math.min(50_000_000, Math.max(1_000_000, pixels * outputFps * factor)));
   return new Quality({ bitrate });
 }
 
@@ -2092,8 +2091,19 @@ async function exportCompositionVideo(
 
   await waitForExportAssets(composition, images, videos, audios);
 
-  const fps = Math.max(1, Math.min(60, finiteNumber(composition.fps, 30)));
-  const durationFrames = Math.max(1, Math.round(finiteNumber(composition.durationFrames, fps * 10)));
+  // "Composition fps" drives everything about EVALUATING the timeline: keyframe/property
+  // interpolation, video/audio seeking, and shouldDrawLayer's frame-range checks are all
+  // keyed to composition-space frame numbers, so `frame` below always stays composition-fps
+  // (renamed compositionFps to make that explicit). "Output fps" only controls how many
+  // frames actually get *encoded* and at what timestamp/duration each one lands in the file -
+  // when it differs from compositionFps, the export loop below resamples to the nearest
+  // composition frame for each output frame, the same way changing the frame rate on an
+  // After Effects render does.
+  const compositionFps = Math.max(1, Math.min(60, finiteNumber(composition.fps, 30)));
+  const outputFps = Math.max(1, Math.min(120, settings.fpsOverride ?? compositionFps));
+  const durationFrames = Math.max(1, Math.round(finiteNumber(composition.durationFrames, compositionFps * 10)));
+  const durationSeconds = durationFrames / compositionFps;
+  const outputFrameCount = Math.max(1, Math.round(durationSeconds * outputFps));
   const compositionWidth = Math.max(1, Math.round(composition.width));
   const compositionHeight = Math.max(1, Math.round(composition.height));
   const { width: exportWidth, height: exportHeight } = scaledExportDimensions(
@@ -2138,10 +2148,10 @@ async function exportCompositionVideo(
   // stretches found while re-testing that fix.
   const videoSource = new CanvasSource(exportCanvas, {
     codec: videoCodec,
-    quality: videoQualityForExport(composition, settings, exportWidth, exportHeight),
+    quality: videoQualityForExport(settings, exportWidth, exportHeight, outputFps),
     keyFrameInterval: 2,
   });
-  output.addVideoTrack(videoSource, { frameRate: fps });
+  output.addVideoTrack(videoSource, { frameRate: outputFps });
 
   // Audio still has to be captured in real time: it comes from actual <video>/<audio>
   // element playback (so pitch/timing stay correct), routed through the Web Audio API
@@ -2165,11 +2175,14 @@ async function exportCompositionVideo(
   await output.start();
 
   const startedAt = performance.now();
-  const progressStep = Math.max(1, Math.round(fps / 4));
+  const progressStep = Math.max(1, Math.round(outputFps / 4));
   let cancelled = false;
 
   try {
-    for (let frame = 0; frame < durationFrames; frame += 1) {
+    for (let outFrame = 0; outFrame < outputFrameCount; outFrame += 1) {
+      // Nearest-frame resampling from output-timeline seconds back to a composition frame
+      // number. When outputFps === compositionFps this reduces to `frame = outFrame` exactly.
+      const frame = Math.min(durationFrames - 1, Math.round((outFrame / outputFps) * compositionFps));
       await Promise.all([
         prepareVideosForExportFrame(composition, frame, videos),
         prepareAudioLayersForExportFrame(composition, frame, audios),
@@ -2184,10 +2197,10 @@ async function exportCompositionVideo(
         showTransparencyGrid: false,
         liveVideoPlayback: true,
       });
-      await videoSource.add(frame / fps, 1 / fps);
+      await videoSource.add(outFrame / outputFps, 1 / outputFps);
 
-      if (frame === 0 || frame % progressStep === 0 || frame === durationFrames - 1) {
-        const percent = Math.min(100, Math.round(((frame + 1) / durationFrames) * 100));
+      if (outFrame === 0 || outFrame % progressStep === 0 || outFrame === outputFrameCount - 1) {
+        const percent = Math.min(100, Math.round(((outFrame + 1) / outputFrameCount) * 100));
         emitVideoExportStatus(`Rendering video ${percent}%`, { jobId, percent, phase: "rendering" });
       }
 
@@ -2196,7 +2209,7 @@ async function exportCompositionVideo(
       // Video frame timestamps above are exact regardless of this loop's actual pacing,
       // so any jitter here no longer affects the output file's correctness, only how
       // closely wall-clock export time tracks composition duration.
-      const nextFrameDueAt = startedAt + ((frame + 1) / fps) * 1000;
+      const nextFrameDueAt = startedAt + ((outFrame + 1) / outputFps) * 1000;
       await waitForExportDelay(nextFrameDueAt - performance.now());
     }
   } catch (error) {

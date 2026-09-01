@@ -24,6 +24,7 @@ import type {
   GraphMode,
   Keyframe,
   Layer,
+  LayerSource,
   LayerType,
   Mask,
   MaskPath,
@@ -91,6 +92,7 @@ type EditorState = {
   importImage: (file: File) => void;
   updateMediaLayerSize: (layerId: string, width: number, height: number, previousWidth?: number, previousHeight?: number) => void;
   updateMediaLayerDuration: (layerId: string, durationSeconds: number) => void;
+  relinkMediaSource: (oldUrl: string, file: File) => void;
   addEffect: (layerId: string, type: EffectType) => void;
   toggleEffectEnabled: (layerId: string, effectId: string) => void;
   reorderEffect: (layerId: string, effectId: string, direction: -1 | 1) => void;
@@ -971,6 +973,85 @@ export const useEditorStore = create<EditorState>()(
             })),
           };
         }),
+      // Media is only ever referenced by a blob: URL (nothing about the actual file gets
+      // saved into the project), so every such URL is dead the moment a project is reopened
+      // in a new session - relinking swaps it for a fresh blob URL made from a file the user
+      // picks now. Unlike updateMediaLayerSize/updateMediaLayerDuration above, this has to
+      // walk every composition in the project (not just the active one), since the same dead
+      // URL can be reused by layers scattered across multiple compositions.
+      relinkMediaSource: (oldUrl, file) => {
+        const newUrl = URL.createObjectURL(file);
+        const isVideo = file.type.startsWith("video/") || /\.mp4$/i.test(file.name);
+        const isAudio = file.type.startsWith("audio/") || /\.(mp3|wav)$/i.test(file.name);
+        const isModel = /\.(glb|gltf)$/i.test(file.name) || file.type === "model/gltf-binary" || file.type === "model/gltf+json";
+
+        let matched = false;
+        set((state) => {
+          const project: Project = {
+            ...state.project,
+            compositions: state.project.compositions.map((composition) => ({
+              ...composition,
+              layers: composition.layers.map((layer) => {
+                const source = layer.source;
+                if (!source) return layer;
+                const isMatch = source.imageUrl === oldUrl || source.videoUrl === oldUrl || source.audioUrl === oldUrl || source.modelUrl === oldUrl;
+                if (!isMatch) return layer;
+                matched = true;
+
+                const nextSource: LayerSource = { ...source, fileName: file.name };
+                if (source.imageUrl === oldUrl) nextSource.imageUrl = newUrl;
+                if (source.videoUrl === oldUrl) nextSource.videoUrl = newUrl;
+                if (source.audioUrl === oldUrl) nextSource.audioUrl = newUrl;
+                if (source.modelUrl === oldUrl) {
+                  nextSource.modelUrl = newUrl;
+                  nextSource.modelFormat = /\.gltf$/i.test(file.name) ? "gltf" : "glb";
+                }
+                return { ...layer, source: nextSource };
+              }),
+            })),
+          };
+          if (!matched) return {};
+          return { project };
+        });
+
+        if (!matched || isModel) return;
+
+        // Refresh the underlying asset's real duration so a relinked video/audio clip that
+        // runs longer or shorter than the original doesn't end up frozen on its last frame
+        // or silently truncated on export - the same class of timing bug fixed earlier.
+        // Layer transforms/position are deliberately left untouched here.
+        if (isAudio || isVideo) {
+          const probe = isAudio ? readAudioMetadata(newUrl) : readVideoMetadata(newUrl);
+          probe
+            .then(({ durationSeconds }) => {
+              baseSet((state) => {
+                let changed = false;
+                const project: Project = {
+                  ...state.project,
+                  compositions: state.project.compositions.map((composition) => {
+                    const safeFps = Math.max(1, Math.round(finiteNumber(composition.fps, 30)));
+                    const durationFrames = Math.max(1, Math.ceil(finiteNumber(durationSeconds, 0) * safeFps));
+                    return {
+                      ...composition,
+                      layers: composition.layers.map((layer) => {
+                        if (layer.type !== "video" && layer.type !== "audio") return layer;
+                        const matchesUrl = layer.source?.videoUrl === newUrl || layer.source?.audioUrl === newUrl;
+                        if (!matchesUrl) return layer;
+                        const endFrame = layer.startFrame + durationFrames;
+                        if (layer.endFrame === endFrame && layer.source?.mediaDurationFrames === durationFrames) return layer;
+                        changed = true;
+                        return { ...layer, endFrame, source: { ...layer.source, mediaDurationFrames: durationFrames } };
+                      }),
+                    };
+                  }),
+                };
+                if (!changed) return {};
+                return { project };
+              });
+            })
+            .catch(() => undefined);
+        }
+      },
       addEffect: (layerId, type) =>
         set((state) => {
           const effect = createEffect(type);

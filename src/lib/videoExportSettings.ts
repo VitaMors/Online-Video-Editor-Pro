@@ -13,6 +13,8 @@ export type VideoExportSettings = {
   resolutionScale: number;
   /** Bits per second. When set and > 0, overrides the quality-derived bitrate entirely. */
   customBitrateMbps?: number;
+  /** Output frame rate. When unset/0, the composition's own fps is used unchanged. */
+  fpsOverride?: number;
 };
 
 export const DEFAULT_VIDEO_EXPORT_SETTINGS: VideoExportSettings = {
@@ -20,6 +22,19 @@ export const DEFAULT_VIDEO_EXPORT_SETTINGS: VideoExportSettings = {
   quality: "high",
   resolutionScale: 1,
 };
+
+export type FpsPreset = { label: string; value: number };
+
+// "0" stands in for "match the composition's own frame rate" - the common case, and the
+// one that needs no retiming/resampling logic at all in the exporter.
+export const FPS_PRESETS: FpsPreset[] = [
+  { label: "Composition FPS", value: 0 },
+  { label: "24", value: 24 },
+  { label: "25", value: 25 },
+  { label: "30", value: 30 },
+  { label: "50", value: 50 },
+  { label: "60", value: 60 },
+];
 
 export const VIDEO_EXPORT_QUALITY_ORDER: VideoExportQuality[] = [
   "very-low",
@@ -68,6 +83,9 @@ export function normalizeVideoExportSettings(settings?: Partial<VideoExportSetti
       : DEFAULT_VIDEO_EXPORT_SETTINGS.resolutionScale,
     customBitrateMbps: settings?.customBitrateMbps && settings.customBitrateMbps > 0
       ? settings.customBitrateMbps
+      : undefined,
+    fpsOverride: settings?.fpsOverride && settings.fpsOverride > 0
+      ? Math.min(120, settings.fpsOverride)
       : undefined,
   };
 }
