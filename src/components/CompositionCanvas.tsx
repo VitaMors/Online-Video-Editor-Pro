@@ -1,10 +1,28 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+import {
+  BufferTarget,
+  CanvasSource,
+  MediaStreamAudioTrackSource,
+  Mp4OutputFormat,
+  Output,
+  Quality,
+  WebMOutputFormat,
+  canEncodeAudio,
+  canEncodeVideo,
+} from "mediabunny";
+import type { AudioCodec, VideoCodec } from "mediabunny";
 import { evaluatePathProperty, evaluateProperty, getLayerSize, getWorldPosition } from "../lib/animation";
 import { compositeOperationForBlendMode } from "../lib/blendModes";
 import { applyColorGradingShader } from "../lib/colorGradingShader";
 import { effectNumberValue, effectStaticValue, isEffectNumberControl } from "../lib/effects";
+import {
+  DEFAULT_VIDEO_EXPORT_SETTINGS,
+  normalizeVideoExportSettings,
+  scaledExportDimensions,
+  type VideoExportSettings,
+} from "../lib/videoExportSettings";
 import { useEditorStore } from "../store/editorStore";
 import type { Composition, Effect, Layer, Mask, MaskPath, SpatialVector, Vector2 } from "../types/editor";
 
@@ -1743,14 +1761,19 @@ function maskScaleDragFactor(scale: Vector2, pointCount: number): Vector2 {
 type ExportVideoDetail = {
   compositionId?: string;
   filename?: string;
+  settings?: VideoExportSettings;
+  jobId?: string;
 };
 
 type VideoExportStatusDetail = {
   message: string;
+  jobId?: string;
+  percent?: number;
+  phase?: "rendering" | "done" | "error";
 };
 
-function emitVideoExportStatus(message: string) {
-  window.dispatchEvent(new CustomEvent<VideoExportStatusDetail>(EXPORT_VIDEO_STATUS_EVENT, { detail: { message } }));
+function emitVideoExportStatus(message: string, detail?: Omit<VideoExportStatusDetail, "message">) {
+  window.dispatchEvent(new CustomEvent<VideoExportStatusDetail>(EXPORT_VIDEO_STATUS_EVENT, { detail: { message, ...detail } }));
 }
 
 function videoExportFileBaseName(name: string) {
@@ -1769,28 +1792,62 @@ function downloadVideoBlob(blob: Blob, filename: string) {
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-function bestVideoRecorderMimeType() {
-  if (typeof MediaRecorder === "undefined") return "";
-  return [
-    "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
-    "video/mp4;codecs=avc1.42E01E",
-    "video/mp4",
-    "video/webm;codecs=vp9,opus",
-    "video/webm;codecs=vp8,opus",
-    "video/webm;codecs=vp9",
-    "video/webm;codecs=vp8",
-    "video/webm",
-  ].find((mimeType) => MediaRecorder.isTypeSupported(mimeType)) ?? "";
+type ResolvedVideoExportFormat = {
+  outputFormat: Mp4OutputFormat | WebMOutputFormat;
+  videoCodec: VideoCodec;
+  audioCodec: AudioCodec | undefined;
+  extension: "mp4" | "webm";
+  mimeType: string;
+};
+
+// Picks real, WebCodecs-encodable codecs up front (rather than assuming avc/aac always
+// work, the way the old MediaRecorder.isTypeSupported() string-matching did) so the
+// export never silently fails partway through with an unsupported-codec encoder error.
+// MP4/H.264+AAC is preferred for broad compatibility (matches "Export as MP4"); WebM/VP9
+// (or VP8)+Opus is the fallback for browsers that can't encode H.264.
+async function resolveVideoExportFormat(
+  width: number,
+  height: number,
+  settings: VideoExportSettings,
+): Promise<ResolvedVideoExportFormat> {
+  const allowMp4 = settings.container !== "webm";
+  const allowWebm = settings.container !== "mp4";
+
+  if (allowMp4 && (await canEncodeVideo("avc", { width, height }))) {
+    const audioCodec: AudioCodec | undefined = (await canEncodeAudio("aac"))
+      ? "aac"
+      : (await canEncodeAudio("opus"))
+        ? "opus"
+        : undefined;
+    return { outputFormat: new Mp4OutputFormat(), videoCodec: "avc", audioCodec, extension: "mp4", mimeType: "video/mp4" };
+  }
+
+  if (allowWebm) {
+    const videoCodec: VideoCodec = (await canEncodeVideo("vp9", { width, height })) ? "vp9" : "vp8";
+    const audioCodec: AudioCodec | undefined = (await canEncodeAudio("opus")) ? "opus" : undefined;
+    return { outputFormat: new WebMOutputFormat(), videoCodec, audioCodec, extension: "webm", mimeType: "video/webm" };
+  }
+
+  throw new Error("This browser cannot encode video in the requested format.");
 }
 
-function extensionForRecorderMimeType(mimeType: string) {
-  return mimeType.includes("mp4") ? "mp4" : "webm";
-}
+const VIDEO_QUALITY_BITRATE_FACTOR: Record<VideoExportSettings["quality"], number> = {
+  "very-low": 0.03,
+  low: 0.05,
+  medium: 0.09,
+  high: 0.14,
+  "very-high": 0.22,
+};
 
-function videoBitrateForComposition(composition: Composition) {
+function videoQualityForExport(composition: Composition, settings: VideoExportSettings, width: number, height: number): Quality {
+  if (settings.customBitrateMbps && settings.customBitrateMbps > 0) {
+    return new Quality({ bitrate: Math.round(settings.customBitrateMbps * 1_000_000) });
+  }
   const fps = Math.max(1, Math.min(60, finiteNumber(composition.fps, 30)));
-  const pixels = Math.max(1, composition.width * composition.height);
-  return Math.round(Math.min(20_000_000, Math.max(2_500_000, pixels * fps * 0.09)));
+  const pixels = Math.max(1, width * height);
+  const factor = VIDEO_QUALITY_BITRATE_FACTOR[settings.quality] ?? VIDEO_QUALITY_BITRATE_FACTOR.high;
+  const bitrate = Math.round(Math.min(50_000_000, Math.max(1_000_000, pixels * fps * factor)));
+  return new Quality({ bitrate });
 }
 
 function waitForExportDelay(milliseconds: number) {
@@ -2028,58 +2085,88 @@ async function exportCompositionVideo(
   videos: Map<string, HTMLVideoElement>,
   audios: Map<string, HTMLAudioElement>,
   filename?: string,
+  rawSettings?: VideoExportSettings,
+  jobId?: string,
 ) {
-  if (!("captureStream" in HTMLCanvasElement.prototype)) {
-    throw new Error("This browser cannot record canvas video exports.");
-  }
-
-  const mimeType = bestVideoRecorderMimeType();
-  if (!mimeType) throw new Error("This browser does not expose a supported video recorder.");
+  const settings = normalizeVideoExportSettings(rawSettings ?? DEFAULT_VIDEO_EXPORT_SETTINGS);
 
   await waitForExportAssets(composition, images, videos, audios);
 
   const fps = Math.max(1, Math.min(60, finiteNumber(composition.fps, 30)));
   const durationFrames = Math.max(1, Math.round(finiteNumber(composition.durationFrames, fps * 10)));
+  const compositionWidth = Math.max(1, Math.round(composition.width));
+  const compositionHeight = Math.max(1, Math.round(composition.height));
+  const { width: exportWidth, height: exportHeight } = scaledExportDimensions(
+    compositionWidth,
+    compositionHeight,
+    settings.resolutionScale,
+  );
+
   const exportCanvas = document.createElement("canvas");
-  exportCanvas.width = Math.max(1, Math.round(composition.width));
-  exportCanvas.height = Math.max(1, Math.round(composition.height));
+  exportCanvas.width = exportWidth;
+  exportCanvas.height = exportHeight;
   const exportContext = exportCanvas.getContext("2d");
   if (!exportContext) throw new Error("Could not create video export canvas.");
+  // renderCompositionFrame always draws in composition-space coordinates (it clears/fills
+  // using composition.width/height directly); scaling the context once up front lets the
+  // export canvas be a different physical size (for resolution-scale presets) without
+  // touching the renderer itself.
+  if (exportWidth !== compositionWidth || exportHeight !== compositionHeight) {
+    exportContext.scale(exportWidth / compositionWidth, exportHeight / compositionHeight);
+  }
 
-  // Passing 0 here puts the canvas track in manual-capture mode: it only ever produces a
-  // frame when requestFrame() is called below. Passing `fps` instead (the previous
-  // behavior) makes the browser ALSO auto-capture on its own timer in parallel with the
-  // manual calls, so the recorder receives roughly double the intended frame rate with
-  // irregular spacing between them - that mismatch was a direct cause of the stutter/
-  // frame-skipping artifacts in exported video.
-  const canvasStream = exportCanvas.captureStream(0);
-  const videoTrack = canvasStream.getVideoTracks()[0] as CanvasCaptureMediaStreamTrack | undefined;
+  const { outputFormat, videoCodec, audioCodec, extension, mimeType } = await resolveVideoExportFormat(
+    exportWidth,
+    exportHeight,
+    settings,
+  );
 
   const audioGraph = buildExportAudioGraph(composition, videos, audios);
   if (audioGraph?.audioContext.state === "suspended") {
     await audioGraph.audioContext.resume().catch(() => undefined);
   }
 
-  const stream = new MediaStream();
-  if (videoTrack) stream.addTrack(videoTrack);
-  audioGraph?.destination.stream.getAudioTracks().forEach((track) => stream.addTrack(track));
+  const output = new Output({ format: outputFormat, target: new BufferTarget() });
 
-  const chunks: Blob[] = [];
-  const recorder = new MediaRecorder(stream, {
-    mimeType,
-    videoBitsPerSecond: videoBitrateForComposition(composition),
+  // CanvasSource.add(timestamp, duration) captures the canvas's current bitmap the moment
+  // it's called and hands it directly to the encoder with an EXACT, caller-supplied
+  // timestamp/duration - unlike the previous captureStream()-based pipeline, there is no
+  // browser-internal capture timer or MediaStream track in between that can race the draw
+  // call, drop frames, or (as happened before) leave the container's per-frame duration
+  // undeclared and have the muxer guess wrong. This is what actually fixes both the
+  // "2s composition exported as a ~1 minute video" bug and the frozen/duplicated-frame
+  // stretches found while re-testing that fix.
+  const videoSource = new CanvasSource(exportCanvas, {
+    codec: videoCodec,
+    quality: videoQualityForExport(composition, settings, exportWidth, exportHeight),
+    keyFrameInterval: 2,
   });
-  const stopped = new Promise<Blob>((resolve, reject) => {
-    recorder.ondataavailable = (event) => {
-      if (event.data.size > 0) chunks.push(event.data);
-    };
-    recorder.onerror = () => reject(new Error("Video export failed."));
-    recorder.onstop = () => resolve(new Blob(chunks, { type: mimeType }));
-  });
+  output.addVideoTrack(videoSource, { frameRate: fps });
 
-  recorder.start(250);
+  // Audio still has to be captured in real time: it comes from actual <video>/<audio>
+  // element playback (so pitch/timing stay correct), routed through the Web Audio API
+  // into a MediaStreamAudioDestinationNode, same as before. MediaStreamAudioTrackSource
+  // pulls from that live track and timestamps it against the same zero point as the
+  // video track, so the two stay in sync even though video frames are added deterministically.
+  const audioTrack = audioGraph?.destination.stream.getAudioTracks()[0];
+  const audioSource = audioTrack && audioCodec
+    ? new MediaStreamAudioTrackSource(audioTrack, { codec: audioCodec, quality: new Quality("high") })
+    : undefined;
+  if (audioSource) {
+    output.addAudioTrack(audioSource);
+    // Never resolves, only rejects - swallow it here (rather than leave it as an unhandled
+    // rejection) since an audio-capture hiccup shouldn't be allowed to crash the whole
+    // export; the resulting file just ends up silent or short on audio in that case.
+    audioSource.errorPromise.catch((error) => {
+      console.error("Audio export capture error:", error);
+    });
+  }
+
+  await output.start();
+
   const startedAt = performance.now();
-  const progressStep = Math.max(1, Math.round(fps));
+  const progressStep = Math.max(1, Math.round(fps / 4));
+  let cancelled = false;
 
   try {
     for (let frame = 0; frame < durationFrames; frame += 1) {
@@ -2097,18 +2184,26 @@ async function exportCompositionVideo(
         showTransparencyGrid: false,
         liveVideoPlayback: true,
       });
-      videoTrack?.requestFrame();
+      await videoSource.add(frame / fps, 1 / fps);
 
-      if (frame === 0 || frame % progressStep === 0) {
+      if (frame === 0 || frame % progressStep === 0 || frame === durationFrames - 1) {
         const percent = Math.min(100, Math.round(((frame + 1) / durationFrames) * 100));
-        emitVideoExportStatus(`Rendering video ${percent}%`);
+        emitVideoExportStatus(`Rendering video ${percent}%`, { jobId, percent, phase: "rendering" });
       }
 
+      // Audio is being captured live from realtime media playback, so the export still
+      // has to run no faster than real time or the captured audio would run short/skip.
+      // Video frame timestamps above are exact regardless of this loop's actual pacing,
+      // so any jitter here no longer affects the output file's correctness, only how
+      // closely wall-clock export time tracks composition duration.
       const nextFrameDueAt = startedAt + ((frame + 1) / fps) * 1000;
       await waitForExportDelay(nextFrameDueAt - performance.now());
     }
+  } catch (error) {
+    cancelled = true;
+    await output.cancel().catch(() => undefined);
+    throw error;
   } finally {
-    if (recorder.state !== "inactive") recorder.stop();
     videos.forEach((video) => video.pause());
     audios.forEach((audio) => audio.pause());
     audioGraph?.tappedNodes.forEach((node) => {
@@ -2120,12 +2215,18 @@ async function exportCompositionVideo(
     });
   }
 
-  const blob = await stopped;
-  stream.getTracks().forEach((track) => track.stop());
+  if (cancelled) return;
+  await output.finalize();
 
-  const extension = extensionForRecorderMimeType(mimeType);
+  const buffer = (output.target as BufferTarget).buffer;
+  if (!buffer) throw new Error("Video export failed to produce output data.");
+  const blob = new Blob([buffer], { type: mimeType });
+
   downloadVideoBlob(blob, `${videoExportFileBaseName(filename ?? composition.name)}.${extension}`);
-  emitVideoExportStatus(extension === "mp4" ? "MP4 export downloaded" : "MP4 unavailable in this browser, downloaded WebM video");
+  emitVideoExportStatus(
+    extension === "mp4" ? "MP4 export downloaded" : "MP4 unavailable in this browser, downloaded WebM video",
+    { jobId, percent: 100, phase: "done" },
+  );
 }
 export function CompositionCanvas() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -2169,18 +2270,35 @@ export function CompositionCanvas() {
   useEffect(() => {
     const onExportVideo = (event: Event) => {
       const detail = (event as CustomEvent<ExportVideoDetail>).detail ?? {};
-      if (!composition || (detail.compositionId && detail.compositionId !== composition.id)) return;
+      if (!composition) return;
+      if (detail.compositionId && detail.compositionId !== composition.id) {
+        // A queued render job targeting a composition that isn't the active one right now
+        // (the Render Queue switches the active composition before dispatching each job,
+        // but the switch may not have propagated to this listener's closure yet). Reporting
+        // this explicitly - instead of silently ignoring the event - keeps the queue from
+        // hanging forever waiting for a status update that would otherwise never arrive.
+        emitVideoExportStatus("Waiting for composition to become active…", { jobId: detail.jobId, phase: "rendering", percent: 0 });
+        return;
+      }
       if (exportInProgressRef.current) {
-        emitVideoExportStatus("Video export already running");
+        emitVideoExportStatus("Video export already running", { jobId: detail.jobId, phase: "error" });
         return;
       }
 
       exportInProgressRef.current = true;
-      emitVideoExportStatus("Rendering video 0%");
-      void exportCompositionVideo(composition, imageCache.current, videoCache.current, audioCache.current, detail.filename)
+      emitVideoExportStatus("Rendering video 0%", { jobId: detail.jobId, phase: "rendering", percent: 0 });
+      void exportCompositionVideo(
+        composition,
+        imageCache.current,
+        videoCache.current,
+        audioCache.current,
+        detail.filename,
+        detail.settings,
+        detail.jobId,
+      )
         .catch((error: unknown) => {
           const message = error instanceof Error ? error.message : "Video export failed.";
-          emitVideoExportStatus(message);
+          emitVideoExportStatus(message, { jobId: detail.jobId, phase: "error" });
         })
         .finally(() => {
           exportInProgressRef.current = false;

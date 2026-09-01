@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { EFFECT_DEFINITIONS, EFFECT_ORDER } from "../lib/effects";
+import { RenderQueue } from "./RenderQueue";
 import { useEditorStore } from "../store/editorStore";
 import type { Composition, EditorTool, EffectType, LayerType, Project } from "../types/editor";
 
@@ -167,6 +168,7 @@ export function MenuBar() {
   const [openMenu, setOpenMenu] = useState<MenuName | null>(null);
   const [confirmNewProjectOpen, setConfirmNewProjectOpen] = useState(false);
   const [compositionSettingsOpen, setCompositionSettingsOpen] = useState(false);
+  const [renderQueueOpen, setRenderQueueOpen] = useState(false);
   const [compositionSettingsDraft, setCompositionSettingsDraft] = useState<CompositionSettingsDraft | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const noticeTimeoutRef = useRef<number | null>(null);
@@ -197,7 +199,7 @@ export function MenuBar() {
   const pasteKeyframes = useEditorStore((state) => state.pasteKeyframes);
   const deleteSelection = useEditorStore((state) => state.deleteSelection);
   const splitSelectedLayers = useEditorStore((state) => state.splitSelectedLayers);
-  const addEffect = useEditorStore((state) => state.addEffect);
+  const addEffect = useEditorStore((state) => state.addEffect);
   const toggleTimeRemap = useEditorStore((state) => state.toggleTimeRemap);
   const freezeTimeRemap = useEditorStore((state) => state.freezeTimeRemap);
   const reverseTimeRemap = useEditorStore((state) => state.reverseTimeRemap);
@@ -347,6 +349,7 @@ export function MenuBar() {
       { label: "Save Project", action: () => void saveProjectFile() },
       { label: "Import Composition", action: () => compositionInputRef.current?.click() },
       { label: "Export Active Composition as MP4", action: exportActiveCompositionVideo, disabled: !activeComposition },
+      { label: "Render Queue…", action: () => setRenderQueueOpen(true) },
       { label: "Import Media", action: () => imageInputRef.current?.click() },
     ],
     Edit: [
@@ -363,6 +366,7 @@ export function MenuBar() {
       { label: "New Adjustment Layer", action: layerAction("adjustment"), disabled: !activeComposition },
       { label: "Import Composition", action: () => compositionInputRef.current?.click() },
       { label: "Export Active Composition as MP4", action: exportActiveCompositionVideo, disabled: !activeComposition },
+      { label: "Render Queue…", action: () => setRenderQueueOpen(true) },
       { label: isPlaying ? "Pause" : "Play", action: togglePlayback },
       { label: showGrid ? "Hide Grid" : "Show Grid", action: toggleGrid },
       { label: showGuides ? "Hide Guides" : "Show Guides", action: toggleGuides },
@@ -514,6 +518,7 @@ export function MenuBar() {
           </div>
         </div>
       ) : null}
+      <RenderQueue open={renderQueueOpen} onClose={() => setRenderQueueOpen(false)} />
     </>
   );
 }
