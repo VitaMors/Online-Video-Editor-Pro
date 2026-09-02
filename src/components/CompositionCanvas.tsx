@@ -2704,6 +2704,13 @@ export function CompositionCanvas() {
   const videoCache = useRef(new Map<string, HTMLVideoElement>());
   const audioCache = useRef(new Map<string, HTMLAudioElement>());
   const exportInProgressRef = useRef(false);
+  // Per-layer {time, targetTime} samples from the last live-preview sync tick, keyed by
+  // videoUrl - lets the live-preview video sync effect below estimate how fast the
+  // composition's own reference clock is ACTUALLY advancing in real wall-clock time (it can run
+  // slower than native 1x under heavy per-frame render cost - see the rAF loop in App.tsx),
+  // instead of only ever assuming that reference runs at a constant 1x. See the effect for why
+  // that assumption was the actual bug behind layers visibly running at different speeds.
+  const videoSyncRateRef = useRef(new Map<string, { time: number; targetTime: number }>());
   const dragRef = useRef<DragState | null>(null);
   const [maskDraft, setMaskDraft] = useState<MaskDraft | null>(null);
   const [textEdit, setTextEdit] = useState<TextEdit | null>(null);
@@ -2968,36 +2975,62 @@ export function CompositionCanvas() {
       // clock (drawLayerContent draws whatever it's currently showing rather than seeking it
       // to the composition's exact frame every draw - see the `playbackDriven` branch there,
       // which deliberately skips syncVideoToFrame so scrubbing doesn't flash intermediate
-      // seeked frames). With several video layers plus effects competing for the same CPU,
-      // each layer's decoder falls behind by a different amount, so they visibly drift out of
-      // sync with each other and with the composition's own playhead clock - exactly "different
-      // layers playing at different speeds".
+      // seeked frames). Meanwhile the reference this is all supposed to track - targetTime,
+      // derived from the composition's own playheadFrame - does NOT always advance at native 1x
+      // in real wall-clock time: the rAF loop in App.tsx deliberately advances the playhead by
+      // at most one frame per tick so a slow frame renders in full instead of being dropped,
+      // which is exactly what happens once several video layers plus per-pixel effects (this
+      // app's Levels/Blur/Curves/Sharpen, each a synchronous getImageData pass) are competing
+      // for the same frame budget. Under that load the reference can end up genuinely,
+      // sustainedly running well under native speed.
       //
-      // The previous fix here only hard-reseeked once drift passed 0.25s (~7-8 frames at
-      // 30fps), and did nothing below that. That's a bad tradeoff either way: it lets
-      // meaningful desync build up silently before "correcting" it, and the correction itself
-      // is a video.currentTime assignment on an actively-playing element, which briefly stalls
-      // that layer's decoder while it re-buffers around the new position - so the very next
-      // check often finds it freshly behind again, forcing another hard seek. Every layer
-      // hitting that cycle independently, over and over through a loop, is what compounded
-      // into "progressively worse each looped playback".
+      // An earlier version of this correction only ever nudged playbackRate a few percent off
+      // 1x, on the assumption that the reference always runs close to native speed and any
+      // drift is just small per-frame decode jitter. That assumption is what made it look like
+      // "layers playing at different speeds" and constant jumping: a video left at native 1x
+      // (or within a few percent of it) drifts further and further ahead of a reference that's
+      // actually running at, say, 60% speed, no matter how long a small nudge runs, because it's
+      // physically incapable of closing a gap that opens faster than it can correct. That
+      // runaway drift kept tripping the hard-reseek branch below over and over - each one
+      // briefly stalling that layer's decoder while it re-buffers around the new position, so
+      // the very next check often found it freshly behind again - and every layer doing this
+      // independently, at its own pace, is what made layers visibly diverge from each other and
+      // compounded into "progressively worse" the longer/more loops playback ran.
       //
-      // Below the hard-reseek threshold, nudge playbackRate by a few percent toward the
-      // target instead of seeking at all - the same technique real multi-track players use for
-      // A/V sync drift correction. It continuously pulls small drift back to zero without ever
-      // interrupting decode, so it doesn't create the next stall. A hard reseek is reserved for
-      // drift big enough that rate-nudging alone would take too long to close (a fresh scrub,
-      // or the jump back to the start on loop).
+      // videoSyncRateRef tracks, per layer, the targetTime this effect saw last tick and when -
+      // from that, observedRate below is a direct real-time measurement of how fast the
+      // reference is ACTUALLY advancing right now, not an assumption that it's close to 1x. Using
+      // that as the video's base playbackRate (with a smaller proportional term layered on top
+      // purely to close any remaining positional drift) lets every layer track the reference's
+      // true current rate - however slow a heavy frame makes that - instead of only ever
+      // fighting a fixed, too-small correction against it.
+      const now = performance.now() / 1000;
+      const rateHistory = videoSyncRateRef.current;
+      const previousSample = rateHistory.get(videoUrl);
+      let observedRate = 1;
+      if (previousSample) {
+        const elapsedReal = now - previousSample.time;
+        // Ignore samples that are implausibly close together (rounding noise) or far apart (a
+        // pause, a tab switch, or a fresh scrub) - fall back to the neutral 1x assumption rather
+        // than let either extreme produce a wild instantaneous rate.
+        if (elapsedReal > 0.01 && elapsedReal < 1.5) {
+          observedRate = (targetTime - previousSample.targetTime) / elapsedReal;
+        }
+      }
+      rateHistory.set(videoUrl, { time: now, targetTime });
+      const baseRate = Number.isFinite(observedRate) ? Math.max(0.15, Math.min(4, observedRate)) : 1;
+
       const drift = video.currentTime - targetTime; // positive: this layer is running ahead
       const absDrift = Math.abs(drift);
       const hardReseekThreshold = 0.3;
 
       if (absDrift > hardReseekThreshold && !video.seeking) {
         safeSeekMedia(video, targetTime);
-        video.playbackRate = 1;
+        video.playbackRate = baseRate;
       } else if (!video.seeking) {
-        const correctionStrength = clampUnit(absDrift / hardReseekThreshold);
-        video.playbackRate = 1 - Math.sign(drift) * Math.min(0.08, correctionStrength * 0.08);
+        const convergeSeconds = 0.5;
+        const desiredRate = baseRate - drift / convergeSeconds;
+        video.playbackRate = Math.max(0.15, Math.min(4, desiredRate));
       }
       if (video.paused) void video.play().catch(() => undefined);
     });
