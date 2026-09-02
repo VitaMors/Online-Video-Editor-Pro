@@ -695,6 +695,7 @@ function drawLayerContent(
   fps: number,
   liveVideoPlayback = false,
   activeCamera?: Layer,
+  exportFrameLocked = false,
 ) {
   const [width, height] = getLayerSize(layer);
   const source = layer.source;
@@ -746,6 +747,33 @@ function drawLayerContent(
     const enoughPreviewBuffer = video ? hasEnoughPreviewBuffer(video, layer, frame, fps) : false;
     const playbackDriven = liveVideoPlayback && !source.timeRemap;
     if (video && !playbackDriven) syncVideoToFrame(video, layer, frame, fps);
+
+    if (exportFrameLocked) {
+      // Export already captured an authoritative, frame-accurate snapshot of this exact
+      // video+frame into videoFrameCache (see rememberVideoFrame calls in
+      // prepareVideosForExportFrame), taken the instant its seek was confirmed via
+      // requestVideoFrameCallback. Drawing the LIVE video element here instead would show
+      // whatever it has continued to decode to in the real time since that snapshot was
+      // taken - videos are deliberately left playing between export frames so audio capture
+      // stays continuous, and several layers' seeks (plus audio prep) run concurrently, so one
+      // layer can sit "confirmed correct" for a while, still playing, before the others - and
+      // the actual draw call - catch up. That gap is exactly what let the exported picture
+      // drift ahead of its own target time despite every seek having been verified correct.
+      // Drawing the pinned snapshot instead of the live element is what makes each exported
+      // frame land on its exact target time regardless of that gap.
+      if (!drawCachedVideoFrame(context, source.videoUrl, width, height)) {
+        // No snapshot yet (e.g. the very first frame of a fresh export) - fall back to
+        // whatever the live element currently shows rather than drawing nothing.
+        if (video && video.readyState >= 2 && video.videoWidth > 0) {
+          context.drawImage(video, 0, 0, width, height);
+          rememberVideoFrame(source.videoUrl, video, width, height);
+        } else {
+          drawMediaPlaceholder(context, width, height, enoughPreviewBuffer ? "" : "Loading Video");
+        }
+      }
+      return;
+    }
+
     // While a seek is in flight the video element still displays its pre-seek frame, so
     // drawing it here would flash the wrong frame during scrubbing/timeline dragging.
     // Prefer the last known-good cached frame until the seek actually resolves.
@@ -1449,6 +1477,7 @@ function drawMaskedLayerContent(
   fps: number,
   liveVideoPlayback: boolean,
   activeCamera?: Layer,
+  exportFrameLocked = false,
 ) {
   const [width, height] = getLayerSize(layer);
   const effectPadding = glowSpreadPadding(layer, frame);
@@ -1456,13 +1485,13 @@ function drawMaskedLayerContent(
   const contentContext = contentCanvas.getContext("2d");
 
   if (!contentContext) {
-    drawLayerContent(context, composition, layer, images, videos, frame, fps, liveVideoPlayback, activeCamera);
+    drawLayerContent(context, composition, layer, images, videos, frame, fps, liveVideoPlayback, activeCamera, exportFrameLocked);
     return;
   }
 
   contentContext.save();
   contentContext.translate(effectPadding, effectPadding);
-  drawLayerContent(contentContext, composition, layer, images, videos, frame, fps, liveVideoPlayback, activeCamera);
+  drawLayerContent(contentContext, composition, layer, images, videos, frame, fps, liveVideoPlayback, activeCamera, exportFrameLocked);
   contentContext.restore();
 
   if (layer.masks.length > 0) {
@@ -1638,6 +1667,7 @@ function drawLayer(
   selectedMaskId?: string,
   liveVideoPlayback = false,
   activeCamera?: Layer,
+  exportFrameLocked = false,
 ) {
   const fps = finiteNumber(composition.fps, 30);
   const motionAmount = composition.motionBlur && layer.motionBlur ? transformMotionAmount(composition, layer, frame) : 0;
@@ -1651,7 +1681,7 @@ function drawLayer(
     context.save();
     context.globalAlpha = (opacity / 100) * alphaScale;
     applyLayerTransform(context, composition, layer, sampleFrame);
-    drawMaskedLayerContent(context, composition, layer, contentFrame, images, videos, fps, liveVideoPlayback, activeCamera);
+    drawMaskedLayerContent(context, composition, layer, contentFrame, images, videos, fps, liveVideoPlayback, activeCamera, exportFrameLocked);
     context.restore();
   };
 
@@ -1709,6 +1739,13 @@ type RenderCompositionFrameOptions = {
   showTransparencyGrid?: boolean;
   includeOverlays?: boolean;
   liveVideoPlayback?: boolean;
+  // Set only by export (see exportCompositionVideo): tells the video-drawing path to trust
+  // the frame-accurate snapshot prepareVideosForExportFrame just captured into
+  // videoFrameCache for this exact frame, instead of the live <video> element - which is
+  // deliberately left playing between export frames (for continuous audio capture) and so
+  // can no longer be trusted to still be showing that exact instant by the time drawing
+  // actually happens. See the exportFrameLocked branch in drawLayerContent for the full story.
+  exportFrameLocked?: boolean;
 };
 
 function renderCompositionFrame(
@@ -1753,13 +1790,13 @@ function renderCompositionFrame(
         applyAdjustmentLayerToCanvas(contentCanvas, composition, layer, frame);
         return;
       }
-      drawLayer(contentContext, composition, layer, frame, options.images, options.videos, false, options.selectedMaskId, options.liveVideoPlayback, activeCamera);
+      drawLayer(contentContext, composition, layer, frame, options.images, options.videos, false, options.selectedMaskId, options.liveVideoPlayback, activeCamera, options.exportFrameLocked);
     });
     context.drawImage(contentCanvas, 0, 0, composition.width, composition.height);
   } else {
     drawableLayers
       .filter((layer) => layer.type !== "adjustment")
-      .forEach((layer) => drawLayer(context, composition, layer, frame, options.images, options.videos, false, options.selectedMaskId, options.liveVideoPlayback, activeCamera));
+      .forEach((layer) => drawLayer(context, composition, layer, frame, options.images, options.videos, false, options.selectedMaskId, options.liveVideoPlayback, activeCamera, options.exportFrameLocked));
   }
 
   if (options.includeOverlays) {
@@ -1987,6 +2024,18 @@ async function seekVideoForExport(media: HTMLMediaElement, time: number, toleran
   });
 }
 
+// NOTE ON A DEAD END, kept as a record so it doesn't get reintroduced: 'seeked' firing does not
+// guarantee the compositor has actually painted the decoded picture for the new position yet,
+// which briefly looked like the cause of an export that stayed frozen on its first frame despite
+// seekVideoForExport correctly moving video.currentTime forward every frame. The fix tried here
+// was awaiting one requestVideoFrameCallback after each seek before drawing - the standard
+// technique for frame-accurate video capture. It looked right in isolation, but under this app's
+// real per-frame load (several video layers plus an Adjustment Layer's Levels/Blur) it made
+// things worse: direct diagnostic logging showed the seek itself consistently landing on the
+// correct currentTime, and then that EXTRA wait consistently reading currentTime back as 0
+// afterward. The actual fix ended up being simpler and is in prepareVideosForExportFrame below:
+// pause before seeking (removes the "seeking a moving target" race a playing video creates) and
+// verify-with-retry after, without any extra frame-presented wait.
 function waitForModelForExport(modelUrl: string) {
   const cachedModel = modelCache.get(modelUrl);
   return cachedModel?.promise ?? Promise.resolve();
@@ -2023,6 +2072,17 @@ function audioLayerActiveAtFrame(layer: Layer, frame: number, soloActive: boolea
 // Dedicated audio layers aren't drawn (shouldDrawLayer excludes them), but the export
 // recording needs them played and paused in lockstep with the composition frame just like
 // video layers, so their sound lands at the right point in the exported timeline.
+//
+// Unlike video (see prepareVideosForExportFrame below - that one now reseeks every frame for
+// correctness, since a video layer showing the wrong instant is immediately, visibly wrong)
+// audio has no per-frame "captured content" to get wrong - it's a continuous stream, so the
+// only failure mode here is drifting far enough to be audibly out of place, which is a much
+// bigger and rarer miss than a single video frame being a fraction of a second off. Kept on
+// the coarser drift tolerance rather than reseeking every frame, since reseeking a *playing*
+// audio element periodically clicks/glitches, and doing that every single frame for no audible
+// benefit would be a straight regression.
+const AUDIO_CONTINUOUS_DRIFT_TOLERANCE = 1;
+
 async function prepareAudioLayersForExportFrame(
   composition: Composition,
   frame: number,
@@ -2042,7 +2102,7 @@ async function prepareAudioLayersForExportFrame(
       if (!audio.paused) audio.pause();
       // Pausing here means a later reactivation is a fresh start, not a continuation - drop
       // it so that frame gets an actual resync seek instead of being trusted like ongoing
-      // continuous playback (see CONTINUOUS_DRIFT_TOLERANCE above).
+      // continuous playback (see AUDIO_CONTINUOUS_DRIFT_TOLERANCE above).
       startedLayers.delete(layer.id);
       return;
     }
@@ -2050,7 +2110,7 @@ async function prepareAudioLayersForExportFrame(
     const duration = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0;
     const targetTime = mediaTimeForFrame(layer, frame, fps, duration);
     const alreadyStarted = startedLayers.has(layer.id);
-    const needsSeek = !alreadyStarted || Math.abs(audio.currentTime - targetTime) > CONTINUOUS_DRIFT_TOLERANCE;
+    const needsSeek = !alreadyStarted || Math.abs(audio.currentTime - targetTime) > AUDIO_CONTINUOUS_DRIFT_TOLERANCE;
     if (needsSeek) {
       await seekVideoForExport(audio, targetTime, 0.06);
       startedLayers.add(layer.id);
@@ -2136,20 +2196,32 @@ function buildExportAudioGraph(composition: Composition, videos: Map<string, HTM
   return { audioContext, destination, tappedNodes };
 }
 
-// Once a video/audio layer's element is up and playing, it advances on its own in real time
-// and stays naturally in sync with each frame's target time - it does NOT need correcting
-// every frame. Poking `.currentTime` on an already-playing element (even just to "fix" a few
-// hundred ms of completely expected per-frame processing jitter) forces the browser to
-// interrupt decode and re-buffer, which drops its readyState back down; if the next frame's
-// check runs before that recovers, it reads as "still not ready" and seeks *again* before the
-// previous seek ever really settled. That created a self-reinforcing seek -> stall -> "needs
-// another seek" cycle that, once started, never let a single frame decode from smooth,
-// continuous playback - every captured frame was grabbed moments after a disruptive re-seek
-// instead, which is what produced the choppy/stuttering exports. So a layer already playing
-// is left alone unless it has drifted by a real amount (e.g. it sat inactive for a gap and
-// needs resyncing) - not on every routine readyState flicker.
-const CONTINUOUS_DRIFT_TOLERANCE = 1;
-
+// PREVIOUS APPROACH (kept here as a record of why it's wrong - do not reintroduce): once a
+// video layer's element was up and playing, this trusted it to "stay naturally in sync" with
+// each frame's target time on its own, only correcting if it drifted by more than a full
+// second. That assumed renderCompositionFrame takes roughly the same, small amount of real
+// wall-clock time every frame - but it doesn't: a frame with heavy effects (an Adjustment
+// Layer's Levels/Blur running over the full composite, several video layers at once, ...) can
+// take many times longer to composite than a light one. The video element keeps decoding and
+// advancing in REAL time the whole time renderCompositionFrame is running (export renders with
+// liveVideoPlayback: true, so drawLayerContent draws whatever the video is showing *right now*
+// rather than seeking it - see the playbackDriven branch there), so after a slow frame the
+// video has raced ahead of where that frame's timestamp says it should be. The captured frame
+// then shows content from further into the clip than its assigned output timestamp implies.
+// That by itself is just "frames a little later than they should be" - survivable. What made
+// it look actively broken was the occasional correction once drift finally exceeded the
+// 1-second tolerance: that reseek snaps the video BACK to the correct target, so the very next
+// captured frame shows earlier content than the frame before it. Export timestamps only ever
+// increase, but the content behind them was zig-zagging forward and backward in time -
+// exactly the "jumping forward and backward during playback" symptom.
+//
+// Frame-accurate export has to seek every video layer to its exact target time for every
+// frame, not just occasionally. The seek helper below (seekVideoForExport) is safe to call
+// every frame - unlike the OLDER bug this file also used to have (see the export reseek-loop
+// history elsewhere in this file), it awaits the real 'seeked'/'loadeddata' event rather than
+// polling readyState, and within a single frame each seek only starts after the previous one
+// on that same element actually finished - see the dedupe step below, which is what makes
+// that true.
 async function prepareVideosForExportFrame(
   composition: Composition,
   frame: number,
@@ -2159,32 +2231,129 @@ async function prepareVideosForExportFrame(
   const soloActive = composition.layers.some((layer) => layer.solo);
   const fps = finiteNumber(composition.fps, 30);
 
-  await Promise.all(composition.layers.map(async (layer) => {
+  // Layers only reference a video URL, not a private decode instance - two layers using the
+  // same source file (the same clip imported twice, or duplicated) share one HTMLVideoElement
+  // via the `videos` cache. Once every active layer seeks every frame (rather than rarely, as
+  // before), that stopped being harmless: composition.layers.map(...) below fires once per
+  // LAYER, so two layers on the same element issued two concurrent seeks to it in the same
+  // frame via Promise.all - both racing to set .currentTime, both listening for the next
+  // 'seeked' event to resolve. Whichever assignment physically lands last "wins" the position,
+  // but either listener can be the one whose event fires and resolves - so a layer could
+  // finish believing it seeked to its own target while the element actually sat at the OTHER
+  // layer's target the whole time. With this triggering on every single frame instead of
+  // rarely, the result wasn't occasional confusion, it was a video that never reliably reached
+  // any layer's real target - which looked exactly like a frozen frame throughout the export.
+  // Deduping by the resolved video element first means each one gets exactly one seek request
+  // per frame, from whichever layer using it is topmost (composition.layers is already
+  // front-to-back - see renderCompositionFrame's `.slice().reverse()` - so the first match is
+  // the one that actually ends up visible when layers using the same source overlap).
+  const seeksByVideo = new Map<HTMLVideoElement, { layer: Layer; targetTime: number }>();
+  composition.layers.forEach((layer) => {
     const videoUrl = layer.source?.videoUrl;
     if (!videoUrl || !shouldDrawLayer(layer, frame, soloActive)) return;
     const video = videos.get(videoUrl);
-    if (!video) return;
-
+    if (!video || seeksByVideo.has(video)) return;
     const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
-    const targetTime = mediaTimeForFrame(layer, frame, fps, duration);
+    seeksByVideo.set(video, { layer, targetTime: mediaTimeForFrame(layer, frame, fps, duration) });
+  });
 
+  // Seeking every layer's video CONCURRENTLY (the original approach here) turned out to
+  // overload Chromium's decode pipeline once more than one video is being paused/seeked/read
+  // back every single frame: isolated, a single video's pause-seek-confirm loop tracked its
+  // targets perfectly, but running that same logic for 3 layers at once via Promise.all
+  // produced readbacks that were sporadically just wrong - a seek that had just been confirmed
+  // correct would read back as currentTime 0 moments later, for no reason attributable to our
+  // own logic (confirmed via direct diagnostic logging of every stage: beforeTime/afterSeekTime
+  // correct, afterRvfcTime suddenly 0). That is decoder resource contention, not a race in this
+  // code - so the fix is to stop creating the contention: seek layers one at a time instead of
+  // concurrently. This makes export prep time scale with layer count instead of being roughly
+  // flat, but a correct, slower export beats a fast, visibly broken one.
+  for (const [video, { layer, targetTime }] of seeksByVideo.entries()) {
     if (layer.source?.timeRemap) {
       video.pause();
-      await seekVideoForExport(video, targetTime);
-      return;
+      // See the retry-loop comment on the non-time-remapped path below for why this no longer
+      // awaits an extra requestVideoFrameCallback round after the seek: that extra wait was
+      // itself the source of corrupted readbacks under this app's real per-frame load, not a
+      // fix for one. A short retry loop is what actually keeps this converged now.
+      let remapVerifiedTime = video.currentTime;
+      for (let attempt = 0; attempt < 5 && (Math.abs(remapVerifiedTime - targetTime) > 0.02 || video.readyState < 2); attempt += 1) {
+        if (attempt > 0) await new Promise((resolve) => window.setTimeout(resolve, 30));
+        await seekVideoForExport(video, targetTime);
+        remapVerifiedTime = video.currentTime;
+      }
+      // Pin this exact, now-confirmed-correct picture into videoFrameCache immediately - see
+      // the exportFrameLocked branch in drawLayerContent for why the draw step reads this
+      // snapshot instead of the live element. See the non-time-remapped path below for why a
+      // failed verification skips the cache write rather than pinning unverified content.
+      if (Math.abs(remapVerifiedTime - targetTime) <= 0.02 && video.readyState >= 2 && video.videoWidth > 0) {
+        const [layerWidth, layerHeight] = getLayerSize(layer);
+        rememberVideoFrame(layer.source.videoUrl!, video, layerWidth, layerHeight);
+      }
+      continue;
     }
 
-    const alreadyStarted = startedLayers.has(layer.id);
-    const needsSeek = !alreadyStarted || Math.abs(video.currentTime - targetTime) > CONTINUOUS_DRIFT_TOLERANCE;
-    if (needsSeek) {
-      await seekVideoForExport(video, targetTime, 0.08);
-      startedLayers.add(layer.id);
+    // Pausing before seeking (this used to only happen for time-remapped layers) matters a lot
+    // more now that every frame gets a real seek instead of rare ones: a video left playing
+    // during the seek is still decoding forward in real time while the seek is in flight, so
+    // the seek is chasing a moving target. Under load - several layers seeking concurrently via
+    // Promise.all, plus effects/audio prep, easily pushes a single output frame's prep well
+    // past its 1/fps real-time budget - that moving-target race got bad enough to make the
+    // *decoded content itself* land on the wrong instant unpredictably (confirmed empirically:
+    // an isolated single-video seek-and-confirm loop tracked its targets smoothly and
+    // monotonically, but this same seek logic produced visibly erratic, non-monotonic content
+    // once three layers were seeking concurrently against continuously-playing video - pausing
+    // first removes the race that isolated case didn't have). A paused video's position is
+    // fully under our control, so the seek converges to exactly the requested frame instead.
+    video.pause();
+    // Tight tolerance (well under one output frame's duration) so every captured frame shows
+    // content from its own correct point in time - seekVideoForExport already no-ops cheaply
+    // when the video happens to already be this close, so this isn't "reseek every frame" in
+    // the expensive sense, it's "verify every frame and correct whenever needed."
+    //
+    // This used to also await an extra requestVideoFrameCallback round after the seek settled,
+    // on the theory that 'seeked' can fire slightly before the decoded picture is actually ready
+    // to paint. That theory was right for a *playing* video, but empirically wrong once the
+    // video is paused first (as it now always is here): direct diagnostic logging under this
+    // app's real load (three video layers plus an Adjustment Layer's Levels/Blur, all running
+    // every frame) showed the seek itself consistently converging to the correct currentTime,
+    // and then that EXTRA wait consistently reading currentTime back as 0 afterward - the wait
+    // itself was corrupting the readback, not fixing anything. The same real load can also
+    // starve the decoder badly enough that a seek "succeeds" (currentTime reads back correct)
+    // but the picture never actually finishes decoding (readyState stuck at HAVE_METADATA). The
+    // retry loop below - with a short yield between attempts, giving the decoder an actual turn
+    // on the event loop instead of hammering it with another seek immediately - is what actually
+    // resolves both of those now that the extra wait is gone.
+    const tolerance = 1 / (fps * 2);
+    let verifiedTime = video.currentTime;
+    for (let attempt = 0; attempt < 5 && (Math.abs(verifiedTime - targetTime) > tolerance || video.readyState < 2); attempt += 1) {
+      if (attempt > 0) await new Promise((resolve) => window.setTimeout(resolve, 30));
+      await seekVideoForExport(video, targetTime, tolerance);
+      verifiedTime = video.currentTime;
     }
+    const seekSucceeded = Math.abs(verifiedTime - targetTime) <= tolerance && video.readyState >= 2;
+    // Pin the confirmed-correct picture right away, before resuming playback below can carry
+    // the live element's decode forward past this instant - see the exportFrameLocked branch in
+    // drawLayerContent for the full rationale. When every retry above still couldn't get this
+    // layer to a verified, decoded position, DON'T overwrite its cache with whatever half-decoded
+    // (or plain wrong) picture is currently resident - drawCachedVideoFrame will keep reusing
+    // that layer's last genuinely-verified frame for this one output frame instead. A layer
+    // occasionally holding its previous frame for an extra 1/30s under heavy resource
+    // contention is a minor, forgivable stutter; overwriting the cache with unverified content
+    // is exactly what was producing the frozen/jumping/wrong-content exports this was all meant
+    // to fix.
+    if (seekSucceeded && video.videoWidth > 0) {
+      const [layerWidth, layerHeight] = getLayerSize(layer);
+      rememberVideoFrame(layer.source!.videoUrl!, video, layerWidth, layerHeight);
+    }
+    startedLayers.add(layer.id);
 
+    // Resume immediately so this layer's audio (tapped live from this same element - see
+    // buildExportAudioGraph) keeps advancing in real time for the rest of this output frame's
+    // duration, right up until the pause() at the top of this function on the next frame.
     video.muted = true;
     video.playbackRate = 1;
-    if (video.paused) await video.play().catch(() => undefined);
-  }));
+    await video.play().catch(() => undefined);
+  }
 }
 
 async function exportCompositionVideo(
@@ -2329,6 +2498,7 @@ async function exportCompositionVideo(
         showBounds: false,
         showTransparencyGrid: false,
         liveVideoPlayback: true,
+        exportFrameLocked: true,
       });
       await videoSource.add(outFrame / outputFps, 1 / outputFps);
 
@@ -2618,6 +2788,22 @@ export function CompositionCanvas() {
   }, [composition, updateMediaLayerSize]);
   useEffect(() => {
     if (!composition) return;
+    // Export drives these same cached <video> elements itself, frame by frame, entirely
+    // independently of this component's isPlaying/playheadFrame state (the editor's playhead
+    // just sits still while an export runs). Every seek the export issues fires a native
+    // 'seeked' event, which the media-cache setup above turns into a setMediaVersion() bump -
+    // that's a dependency of this very effect, so each of the export's per-frame seeks was
+    // re-running this effect in the middle of the export. With isPlaying still false and
+    // playheadFrame still wherever the editor's playhead was left (frame 0, if export was
+    // kicked off without ever pressing play), canUseLivePlayback came out false every time,
+    // so this effect immediately paused the video and reseeked it back toward the PLAYHEAD's
+    // target time - fighting the export's own seek to the CURRENT EXPORT FRAME's target time
+    // on literally every frame. That tug-of-war is what made the exported video look frozen
+    // near time zero for its entire duration instead of advancing. Bailing out here while an
+    // export is in flight leaves the export's own per-frame seeking (prepareVideosForExportFrame)
+    // as the only thing touching these elements, and this effect naturally resumes driving live
+    // preview again once the export's finally-block clears exportInProgressRef.
+    if (exportInProgressRef.current) return;
     const soloActive = composition.layers.some((layer) => layer.solo);
     const fps = finiteNumber(composition.fps, 30);
 
@@ -2684,6 +2870,12 @@ export function CompositionCanvas() {
 
   useEffect(() => {
     if (!composition) return;
+    // Same reason as the video live-sync effect above: export drives these cached <audio>
+    // elements itself every frame, and every seek it issues fires 'seeked' -> setMediaVersion,
+    // which is a dependency here too. Without this bail, this effect would fight the export's
+    // own audio pacing (prepareAudioLayersForExportFrame) using the editor's stale, unmoving
+    // playhead position instead of the export's current frame.
+    if (exportInProgressRef.current) return;
     const soloActive = composition.layers.some((layer) => layer.solo);
 
     composition.layers.forEach((layer) => {
