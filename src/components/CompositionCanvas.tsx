@@ -2,17 +2,21 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import {
+  ALL_FORMATS,
   BufferTarget,
+  CanvasSink,
   CanvasSource,
+  Input,
   MediaStreamAudioTrackSource,
   Mp4OutputFormat,
   Output,
   Quality,
+  UrlSource,
   WebMOutputFormat,
   canEncodeAudio,
   canEncodeVideo,
 } from "mediabunny";
-import type { AudioCodec, VideoCodec } from "mediabunny";
+import type { AudioCodec, VideoCodec, WrappedCanvas } from "mediabunny";
 import { evaluatePathProperty, evaluateProperty, getLayerSize, getWorldPosition } from "../lib/animation";
 import { compositeOperationForBlendMode } from "../lib/blendModes";
 import { applyColorGradingShader } from "../lib/colorGradingShader";
@@ -696,6 +700,7 @@ function drawLayerContent(
   liveVideoPlayback = false,
   activeCamera?: Layer,
   exportFrameLocked = false,
+  exportVideoFrames?: ExportVideoFrames,
 ) {
   const [width, height] = getLayerSize(layer);
   const source = layer.source;
@@ -749,21 +754,30 @@ function drawLayerContent(
     if (video && !playbackDriven) syncVideoToFrame(video, layer, frame, fps);
 
     if (exportFrameLocked) {
-      // Export already captured an authoritative, frame-accurate snapshot of this exact
-      // video+frame into videoFrameCache (see rememberVideoFrame calls in
-      // prepareVideosForExportFrame), taken the instant its seek was confirmed via
-      // requestVideoFrameCallback. Drawing the LIVE video element here instead would show
-      // whatever it has continued to decode to in the real time since that snapshot was
-      // taken - videos are deliberately left playing between export frames so audio capture
-      // stays continuous, and several layers' seeks (plus audio prep) run concurrently, so one
-      // layer can sit "confirmed correct" for a while, still playing, before the others - and
-      // the actual draw call - catch up. That gap is exactly what let the exported picture
-      // drift ahead of its own target time despite every seek having been verified correct.
-      // Drawing the pinned snapshot instead of the live element is what makes each exported
-      // frame land on its exact target time regardless of that gap.
+      // The authoritative source of pixels for an exported video layer is a deterministic,
+      // seek-free decode: buildExportVideoDecoders (see exportCompositionVideo) opens a
+      // dedicated mediabunny/WebCodecs decoder per video layer and feeds it the exact list of
+      // composition timestamps it will need, one per output frame, resolved via
+      // canvasesAtTimestamps. That path never touches a live, possibly-still-playing <video>
+      // element's currentTime/seek state at all, which is what finally eliminates this export's
+      // long-standing "jumping forward and backward" corruption: every earlier fix here
+      // (pause-before-seek, sequential seeking, retry-with-yield, pinning only
+      // verification-confirmed frames into videoFrameCache) was still built on the premise that
+      // a <video> element's currentTime reading back correct means the picture drawImage would
+      // grab is also correct - and under this app's real multi-layer/heavy-effects load, that
+      // premise kept turning out false: the element could report the right time while still
+      // handing back a stale or wrong decoded picture. Reading exact frames straight out of a
+      // WebCodecs decoder by timestamp has no such gap.
+      const decodedFrame = exportVideoFrames?.get(layer.id);
+      if (decodedFrame) {
+        context.drawImage(decodedFrame.canvas, 0, 0, width, height);
+        return;
+      }
+      // Fallback only: the layer's dedicated decoder failed to initialize (e.g. an
+      // unsupported/undetectable codec) or hasn't produced a frame yet for this exact
+      // timestamp (before the track's first frame). Reuse the old live-element/cache path
+      // rather than drawing nothing.
       if (!drawCachedVideoFrame(context, source.videoUrl, width, height)) {
-        // No snapshot yet (e.g. the very first frame of a fresh export) - fall back to
-        // whatever the live element currently shows rather than drawing nothing.
         if (video && video.readyState >= 2 && video.videoWidth > 0) {
           context.drawImage(video, 0, 0, width, height);
           rememberVideoFrame(source.videoUrl, video, width, height);
@@ -1478,6 +1492,7 @@ function drawMaskedLayerContent(
   liveVideoPlayback: boolean,
   activeCamera?: Layer,
   exportFrameLocked = false,
+  exportVideoFrames?: ExportVideoFrames,
 ) {
   const [width, height] = getLayerSize(layer);
   const effectPadding = glowSpreadPadding(layer, frame);
@@ -1485,13 +1500,13 @@ function drawMaskedLayerContent(
   const contentContext = contentCanvas.getContext("2d");
 
   if (!contentContext) {
-    drawLayerContent(context, composition, layer, images, videos, frame, fps, liveVideoPlayback, activeCamera, exportFrameLocked);
+    drawLayerContent(context, composition, layer, images, videos, frame, fps, liveVideoPlayback, activeCamera, exportFrameLocked, exportVideoFrames);
     return;
   }
 
   contentContext.save();
   contentContext.translate(effectPadding, effectPadding);
-  drawLayerContent(contentContext, composition, layer, images, videos, frame, fps, liveVideoPlayback, activeCamera, exportFrameLocked);
+  drawLayerContent(contentContext, composition, layer, images, videos, frame, fps, liveVideoPlayback, activeCamera, exportFrameLocked, exportVideoFrames);
   contentContext.restore();
 
   if (layer.masks.length > 0) {
@@ -1668,6 +1683,7 @@ function drawLayer(
   liveVideoPlayback = false,
   activeCamera?: Layer,
   exportFrameLocked = false,
+  exportVideoFrames?: ExportVideoFrames,
 ) {
   const fps = finiteNumber(composition.fps, 30);
   const motionAmount = composition.motionBlur && layer.motionBlur ? transformMotionAmount(composition, layer, frame) : 0;
@@ -1681,7 +1697,7 @@ function drawLayer(
     context.save();
     context.globalAlpha = (opacity / 100) * alphaScale;
     applyLayerTransform(context, composition, layer, sampleFrame);
-    drawMaskedLayerContent(context, composition, layer, contentFrame, images, videos, fps, liveVideoPlayback, activeCamera, exportFrameLocked);
+    drawMaskedLayerContent(context, composition, layer, contentFrame, images, videos, fps, liveVideoPlayback, activeCamera, exportFrameLocked, exportVideoFrames);
     context.restore();
   };
 
@@ -1727,6 +1743,15 @@ function drawDraftMask(
 }
 
 
+// Keyed by layer.id. Populated once per output frame during export (see
+// buildExportVideoDecoders / exportCompositionVideo) by pulling the next decoded picture out
+// of each video layer's own deterministic mediabunny/WebCodecs decoder - see the
+// exportFrameLocked branch in drawLayerContent for why this replaced seeking a live <video>
+// element as the source of exported pixels. A missing entry (or an explicit `null`, meaning
+// the decoder ran but had no frame yet for this timestamp) falls back to the older
+// cache/live-element path.
+type ExportVideoFrames = Map<string, WrappedCanvas | null>;
+
 type RenderCompositionFrameOptions = {
   images: Map<string, HTMLImageElement>;
   videos: Map<string, HTMLVideoElement>;
@@ -1746,6 +1771,9 @@ type RenderCompositionFrameOptions = {
   // can no longer be trusted to still be showing that exact instant by the time drawing
   // actually happens. See the exportFrameLocked branch in drawLayerContent for the full story.
   exportFrameLocked?: boolean;
+  // Set only by export: this frame's already-decoded picture for every video layer that has
+  // a working deterministic decoder, see ExportVideoFrames above.
+  exportVideoFrames?: ExportVideoFrames;
 };
 
 function renderCompositionFrame(
@@ -1790,13 +1818,13 @@ function renderCompositionFrame(
         applyAdjustmentLayerToCanvas(contentCanvas, composition, layer, frame);
         return;
       }
-      drawLayer(contentContext, composition, layer, frame, options.images, options.videos, false, options.selectedMaskId, options.liveVideoPlayback, activeCamera, options.exportFrameLocked);
+      drawLayer(contentContext, composition, layer, frame, options.images, options.videos, false, options.selectedMaskId, options.liveVideoPlayback, activeCamera, options.exportFrameLocked, options.exportVideoFrames);
     });
     context.drawImage(contentCanvas, 0, 0, composition.width, composition.height);
   } else {
     drawableLayers
       .filter((layer) => layer.type !== "adjustment")
-      .forEach((layer) => drawLayer(context, composition, layer, frame, options.images, options.videos, false, options.selectedMaskId, options.liveVideoPlayback, activeCamera, options.exportFrameLocked));
+      .forEach((layer) => drawLayer(context, composition, layer, frame, options.images, options.videos, false, options.selectedMaskId, options.liveVideoPlayback, activeCamera, options.exportFrameLocked, options.exportVideoFrames));
   }
 
   if (options.includeOverlays) {
@@ -2356,6 +2384,94 @@ async function prepareVideosForExportFrame(
   }
 }
 
+type ExportVideoDecoder = {
+  input: Input;
+  // Fed the exact, in-order list of composition timestamps this layer will need across the
+  // whole export up front, so mediabunny can decode each source packet at most once even
+  // though frames are only actually pulled (via .next()) one at a time as the main export
+  // loop reaches each output frame - see the call site in exportCompositionVideo.
+  generator: AsyncGenerator<WrappedCanvas | null, void, unknown>;
+};
+
+// Builds one deterministic, seek-free decoder per video layer for use during export. This
+// exists because extracting frames by seeking a live <video> element - the approach used
+// everywhere else in this file, including live preview and scrubbing, where it works fine -
+// turned out to be fundamentally unreliable specifically under this app's real per-frame
+// export load (multiple video layers plus an Adjustment Layer's effects, all reseeking every
+// output frame): video.currentTime reading back as the correct, verified target time does not
+// guarantee the picture a subsequent drawImage(video, ...) grabs actually corresponds to that
+// instant, and under heavy main-thread contention it measurably didn't, no matter how much
+// pause/retry/yield/verification logic got layered on top (see the long comment trail in
+// prepareVideosForExportFrame). mediabunny already ships a WebCodecs-based decode path
+// (CanvasSink) built for exactly this: given a source file and a list of timestamps, it hands
+// back the exact decoded picture for each one, with no live playback/seek race involved at
+// all, because there is no live <video> element in this path to race - it reads and decodes
+// the encoded bytes directly. The <video>/<audio> elements in `videos`/`audios` are still kept
+// playing during export (see prepareVideosForExportFrame and buildExportAudioGraph) purely so
+// their audio tracks can still be captured live in real time; this function's output is only
+// ever used for pixels, never audio.
+async function buildExportVideoDecoders(
+  composition: Composition,
+  compositionFps: number,
+  outputFps: number,
+  outputFrameCount: number,
+  durationFrames: number,
+  videos: Map<string, HTMLVideoElement>,
+): Promise<Map<string, ExportVideoDecoder>> {
+  const decoders = new Map<string, ExportVideoDecoder>();
+
+  for (const layer of composition.layers) {
+    const videoUrl = layer.source?.videoUrl;
+    if (layer.type !== "video" || !videoUrl) continue;
+
+    // mediaTimeForFrame needs the SOURCE clip's own duration to clamp against (so a layer
+    // trimmed past the end of its source doesn't request an out-of-range timestamp) - the
+    // already-loaded live <video> element is a cheap, reliable place to read that from rather
+    // than probing the file a second time via the new Input.
+    const liveVideo = videos.get(videoUrl);
+    const sourceDuration = liveVideo && Number.isFinite(liveVideo.duration) && liveVideo.duration > 0 ? liveVideo.duration : 0;
+
+    // Precompute the exact timestamp this layer needs for every output frame, up front, using
+    // the identical nearest-frame resampling the main export loop uses for `frame` itself (see
+    // exportCompositionVideo) - this list is what keeps this layer's decoder perfectly in sync
+    // with the main loop's per-output-frame iteration below, one canvasesAtTimestamps() result
+    // pulled per .next() call.
+    const timestamps: number[] = [];
+    for (let outFrame = 0; outFrame < outputFrameCount; outFrame += 1) {
+      const frame = Math.min(durationFrames - 1, Math.round((outFrame / outputFps) * compositionFps));
+      timestamps.push(mediaTimeForFrame(layer, frame, compositionFps, sourceDuration));
+    }
+
+    try {
+      const input = new Input({ source: new UrlSource(videoUrl), formats: ALL_FORMATS });
+      const track = await input.getPrimaryVideoTrack();
+      if (!track) {
+        input.dispose();
+        continue;
+      }
+      // Some codec/profile combinations a browser can play in a <video> element still aren't
+      // accepted by WebCodecs (canDecode is stricter than <video> playback) - confirm this
+      // track is actually decodable before committing to it, so an unusual source file falls
+      // back to the old live-element path for just that one layer instead of only discovering
+      // the problem (and throwing) partway through the export loop below.
+      const decodable = await track.canDecode();
+      if (!decodable) {
+        input.dispose();
+        continue;
+      }
+      const sink = new CanvasSink(track);
+      decoders.set(layer.id, { input, generator: sink.canvasesAtTimestamps(timestamps) });
+    } catch (error) {
+      // Leave this layer without an entry in the map - the exportFrameLocked branch in
+      // drawLayerContent falls back to the old live-element/cache path whenever a layer has no
+      // decoder, so one layer's unusual/unsupported source file can't fail the whole export.
+      console.error(`Deterministic export decoder failed to initialize for video layer "${layer.id}":`, error);
+    }
+  }
+
+  return decoders;
+}
+
 async function exportCompositionVideo(
   composition: Composition,
   images: Map<string, HTMLImageElement>,
@@ -2480,14 +2596,25 @@ async function exportCompositionVideo(
   // re-seeking every frame - see the comment on CONTINUOUS_DRIFT_TOLERANCE above.
   const startedMediaLayers = new Set<string>();
 
+  // See buildExportVideoDecoders for the full rationale: this is what actually supplies the
+  // pixels for every exported video layer now, independent of and in parallel with the
+  // <video> elements below (which still run every frame, but now purely to keep audio capture
+  // live and in sync - see prepareVideosForExportFrame).
+  const videoDecoders = await buildExportVideoDecoders(composition, compositionFps, outputFps, outputFrameCount, durationFrames, videos);
+
   try {
     for (let outFrame = 0; outFrame < outputFrameCount; outFrame += 1) {
       // Nearest-frame resampling from output-timeline seconds back to a composition frame
       // number. When outputFps === compositionFps this reduces to `frame = outFrame` exactly.
       const frame = Math.min(durationFrames - 1, Math.round((outFrame / outputFps) * compositionFps));
+      const exportVideoFrames: ExportVideoFrames = new Map();
       await Promise.all([
         prepareVideosForExportFrame(composition, frame, videos, startedMediaLayers),
         prepareAudioLayersForExportFrame(composition, frame, audios, startedMediaLayers),
+        ...[...videoDecoders.entries()].map(async ([layerId, decoder]) => {
+          const { value, done } = await decoder.generator.next();
+          exportVideoFrames.set(layerId, done ? null : (value ?? null));
+        }),
       ]);
       renderCompositionFrame(exportContext, composition, frame, {
         images,
@@ -2499,6 +2626,7 @@ async function exportCompositionVideo(
         showTransparencyGrid: false,
         liveVideoPlayback: true,
         exportFrameLocked: true,
+        exportVideoFrames,
       });
       await videoSource.add(outFrame / outputFps, 1 / outputFps);
 
@@ -2524,6 +2652,13 @@ async function exportCompositionVideo(
     audioSource?.pause();
     videos.forEach((video) => video.pause());
     audios.forEach((audio) => audio.pause());
+    videoDecoders.forEach((decoder) => {
+      try {
+        decoder.input.dispose();
+      } catch {
+        // Already disposed or never fully initialized - safe to ignore during cleanup.
+      }
+    });
     audioGraph?.tappedNodes.forEach((node) => {
       try {
         node.disconnect(audioGraph.destination);
