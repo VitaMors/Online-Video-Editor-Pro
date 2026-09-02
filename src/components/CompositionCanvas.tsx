@@ -101,21 +101,55 @@ function borrowScratchCanvas(width: number, height: number) {
     scratchCanvasPool.push(entry);
   }
   entry.inUse = true;
-  // willReadFrequently is critical here: every pixel-processing effect (Levels, Hue/Saturation,
-  // Fill, Tint, Noise, ...) round-trips through a scratch canvas via getImageData/putImageData
-  // (see imageDataCanvas below). getContext() only honors this hint on the FIRST call for a
-  // given canvas - and because these canvases are pooled/reused frame-to-frame, whichever mode
-  // wins here is locked in for the canvas's lifetime. Without it, the pool hands out
-  // GPU-accelerated canvases, so every getImageData call forces a GPU->CPU readback stall;
-  // with 5+ layers (especially an Adjustment Layer, which runs its effects over the FULL
-  // composite at full composition resolution rather than a single layer) this was slow enough
-  // to look like playback had frozen entirely, even though frames were still advancing correctly.
-  const context = entry.canvas.getContext("2d", { willReadFrequently: true });
+  // Deliberately NOT willReadFrequently here. This pool backs every scratch canvas in the
+  // render pipeline - most of what runs through it is pure drawImage compositing (layer draws,
+  // blend modes, blur/filter compositing, the main per-frame content canvas), which is exactly
+  // what GPU-accelerated canvases are fast at. Forcing the whole pool into software rendering
+  // (which was tried here previously) helps the handful of call sites that actually round-trip
+  // through getImageData/putImageData, but drags down every other draw call along with them -
+  // on a real GPU-accelerated browser that's a net loss. The few effects that truly need
+  // repeated pixel readback (Levels, Hue/Saturation, Fill, Tint, Noise, ...) get their own
+  // dedicated software-backed canvas from borrowReadbackCanvas() instead - see imageDataCanvas.
+  const context = entry.canvas.getContext("2d");
   if (context) {
     context.imageSmoothingEnabled = true;
     context.imageSmoothingQuality = "high";
     context.clearRect(0, 0, pixelWidth, pixelHeight);
   }
+  return entry.canvas;
+}
+
+// Separate, smaller pool for canvases that are actually read back via getImageData
+// (see imageDataCanvas). These are deliberately created with willReadFrequently: true, which
+// browsers only honor on a canvas's first getContext() call - keeping them out of the general
+// scratchCanvasPool above means that hint never leaks onto canvases that are only ever
+// drawImage'd into/from.
+const readbackCanvasPool: ScratchCanvasEntry[] = [];
+const READBACK_CANVAS_POOL_CAP = 32;
+
+function resetReadbackCanvasPool() {
+  readbackCanvasPool.forEach((entry) => {
+    entry.inUse = false;
+  });
+  if (readbackCanvasPool.length > READBACK_CANVAS_POOL_CAP) {
+    readbackCanvasPool.length = READBACK_CANVAS_POOL_CAP;
+  }
+}
+
+function borrowReadbackCanvas(width: number, height: number) {
+  const pixelWidth = Math.max(1, Math.round(width));
+  const pixelHeight = Math.max(1, Math.round(height));
+  let entry = readbackCanvasPool.find((candidate) => !candidate.inUse && candidate.canvas.width === pixelWidth && candidate.canvas.height === pixelHeight);
+  if (!entry) {
+    const canvas = document.createElement("canvas");
+    canvas.width = pixelWidth;
+    canvas.height = pixelHeight;
+    entry = { canvas, inUse: false };
+    readbackCanvasPool.push(entry);
+  }
+  entry.inUse = true;
+  const context = entry.canvas.getContext("2d", { willReadFrequently: true });
+  if (context) context.clearRect(0, 0, pixelWidth, pixelHeight);
   return entry.canvas;
 }
 
@@ -845,7 +879,7 @@ function blendWithOriginal(original: HTMLCanvasElement, processed: HTMLCanvasEle
 }
 
 function imageDataCanvas(source: HTMLCanvasElement, mutator: (data: Uint8ClampedArray) => void) {
-  const canvas = canvasLike(source);
+  const canvas = borrowReadbackCanvas(source.width, source.height);
   const context = canvas.getContext("2d", { willReadFrequently: true });
   if (!context) return source;
   context.drawImage(source, 0, 0);
@@ -1012,18 +1046,31 @@ function curvesCanvas(source: HTMLCanvasElement, effect: Effect, frame: number) 
   }), mix);
 }
 
+// Same fix as Levels above (see buildLevelsLut): the exposure/offset/gamma curve only
+// depends on the input byte value, so it's precomputed once into a 256-entry table instead
+// of running Math.pow per channel per pixel (~6.2 million calls/frame at 1080p otherwise).
+function buildExposureLut(exposure: number, offset: number, gamma: number) {
+  const lut = new Uint8ClampedArray(256);
+  const invGamma = 1 / gamma;
+  for (let value = 0; value < 256; value += 1) {
+    const normalized = clampUnit((value / 255) * exposure + offset);
+    lut[value] = clampByte(normalized ** invGamma * 255);
+  }
+  return lut;
+}
+
 function exposureCanvas(source: HTMLCanvasElement, effect: Effect, frame: number) {
   const mix = mixWithOriginalAmount(effect, frame);
   if (mix >= 0.999) return source;
   const exposure = 2 ** effectNumberValue(effect, "exposure", frame);
   const offset = effectNumberValue(effect, "offset", frame);
   const gamma = Math.max(0.1, effectNumberValue(effect, "gamma", frame));
+  const lut = buildExposureLut(exposure, offset, gamma);
   return blendWithOriginal(source, imageDataCanvas(source, (data) => {
     for (let index = 0; index < data.length; index += 4) {
-      for (let channel = 0; channel < 3; channel += 1) {
-        const normalized = clampUnit(data[index + channel] / 255 * exposure + offset);
-        data[index + channel] = clampByte(normalized ** (1 / gamma) * 255);
-      }
+      data[index] = lut[data[index]];
+      data[index + 1] = lut[data[index + 1]];
+      data[index + 2] = lut[data[index + 2]];
     }
   }), mix);
 }
@@ -1155,11 +1202,18 @@ function sharpenCanvas(source: HTMLCanvasElement, effect: Effect, frame: number)
   const amount = effectNumberValue(effect, "amount", frame) / 100;
   if (mix >= 0.999 || amount <= 0) return source;
   const blurred = filteredCanvas(source, "blur(1px)");
-  const canvas = canvasLike(source);
-  const context = canvas.getContext("2d");
-  const blurredContext = blurred.getContext("2d", { willReadFrequently: true });
+  // Both of these get read back via getImageData below, every frame this effect is active -
+  // pull them from the dedicated readback pool (see imageDataCanvas) rather than the general
+  // one, same reasoning as Levels/Exposure: without it, `blurred.getContext(2d, {willReadFrequently})`
+  // was a no-op anyway, since filteredCanvas() had already created that canvas's context (via
+  // the general pool) a moment earlier - the hint only takes on a canvas's *first* getContext call.
+  const canvas = borrowReadbackCanvas(source.width, source.height);
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  const softCanvas = borrowReadbackCanvas(source.width, source.height);
+  const blurredContext = softCanvas.getContext("2d", { willReadFrequently: true });
   if (!context || !blurredContext) return source;
   context.drawImage(source, 0, 0);
+  blurredContext.drawImage(blurred, 0, 0);
   const sharp = context.getImageData(0, 0, canvas.width, canvas.height);
   const soft = blurredContext.getImageData(0, 0, canvas.width, canvas.height);
   for (let index = 0; index < sharp.data.length; index += 4) {
@@ -1671,6 +1725,7 @@ function renderCompositionFrame(
   // those canvases be reused frame-to-frame instead of reallocated, which is what was
   // causing playback and export to stutter under load.
   resetScratchCanvasPool();
+  resetReadbackCanvasPool();
   configureHighQualityContext(context);
 
   context.clearRect(0, 0, composition.width, composition.height);
