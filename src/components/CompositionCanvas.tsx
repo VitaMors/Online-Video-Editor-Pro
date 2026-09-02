@@ -2634,6 +2634,7 @@ export function CompositionCanvas() {
 
       if (!canUseLivePlayback) {
         video.pause();
+        video.playbackRate = 1;
         if (active && Math.abs(video.currentTime - targetTime) > 0.05 && !video.seeking) {
           safeSeekMedia(video, targetTime);
         }
@@ -2641,9 +2642,41 @@ export function CompositionCanvas() {
       }
 
       video.muted = true;
-      video.playbackRate = 1;
-      if (Math.abs(video.currentTime - targetTime) > 0.25 && !video.seeking) {
+
+      // During live playback each <video> element decodes and advances on its OWN real-time
+      // clock (drawLayerContent draws whatever it's currently showing rather than seeking it
+      // to the composition's exact frame every draw - see the `playbackDriven` branch there,
+      // which deliberately skips syncVideoToFrame so scrubbing doesn't flash intermediate
+      // seeked frames). With several video layers plus effects competing for the same CPU,
+      // each layer's decoder falls behind by a different amount, so they visibly drift out of
+      // sync with each other and with the composition's own playhead clock - exactly "different
+      // layers playing at different speeds".
+      //
+      // The previous fix here only hard-reseeked once drift passed 0.25s (~7-8 frames at
+      // 30fps), and did nothing below that. That's a bad tradeoff either way: it lets
+      // meaningful desync build up silently before "correcting" it, and the correction itself
+      // is a video.currentTime assignment on an actively-playing element, which briefly stalls
+      // that layer's decoder while it re-buffers around the new position - so the very next
+      // check often finds it freshly behind again, forcing another hard seek. Every layer
+      // hitting that cycle independently, over and over through a loop, is what compounded
+      // into "progressively worse each looped playback".
+      //
+      // Below the hard-reseek threshold, nudge playbackRate by a few percent toward the
+      // target instead of seeking at all - the same technique real multi-track players use for
+      // A/V sync drift correction. It continuously pulls small drift back to zero without ever
+      // interrupting decode, so it doesn't create the next stall. A hard reseek is reserved for
+      // drift big enough that rate-nudging alone would take too long to close (a fresh scrub,
+      // or the jump back to the start on loop).
+      const drift = video.currentTime - targetTime; // positive: this layer is running ahead
+      const absDrift = Math.abs(drift);
+      const hardReseekThreshold = 0.3;
+
+      if (absDrift > hardReseekThreshold && !video.seeking) {
         safeSeekMedia(video, targetTime);
+        video.playbackRate = 1;
+      } else if (!video.seeking) {
+        const correctionStrength = clampUnit(absDrift / hardReseekThreshold);
+        video.playbackRate = 1 - Math.sign(drift) * Math.min(0.08, correctionStrength * 0.08);
       }
       if (video.paused) void video.play().catch(() => undefined);
     });
