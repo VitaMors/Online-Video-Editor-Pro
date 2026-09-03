@@ -752,6 +752,10 @@ type LiveTimeRemapDecoder = {
   desiredFrame: number | null;
   desiredTargetTime: number | null;
   disposed: boolean;
+  // The most recent frame this decoder actually finished decoding, kept regardless of whether
+  // it's still the one the playhead currently wants - see the "hold, don't guess" comment on
+  // requestLiveTimeRemapFrame below for why this exists and how it's used.
+  lastResolvedCanvas: WrappedCanvas | null;
 };
 
 const LIVE_TIME_REMAP_CACHE_LIMIT = 90;
@@ -762,6 +766,25 @@ const LIVE_TIME_REMAP_CACHE_LIMIT = 90;
 // playback), the newer request just overwrites desiredFrame/desiredTargetTime and gets picked
 // up as soon as the in-flight one resolves - rather than queuing every intermediate frame,
 // which would only fall further and further behind real time under sustained playback.
+//
+// Hold, don't guess: a steep or reversed Time Remap ramp can ask for a genuinely distant,
+// direction-reversing timestamp on literally every tick (e.g. dragging the ramp's two
+// keyframes to swap ends, so 3 seconds of composition time plays several seconds of source
+// backwards) - decoding each of those can legitimately take longer than one tick, so most
+// ticks land on a cache miss for the EXACT frame wanted. The two ways to handle a miss are
+// "wait for the exact frame" (what happens naturally here, via lastResolvedCanvas below) or
+// "ask something else for a frame right now" - and that something else used to be the native
+// <video> element's seek path once its own stall passed 200ms (see videoSeekStallMs above).
+// That path is exactly what produced the reported bug: mid-reversal, the video element is
+// forever chasing a moving, backward-jumping seek target, so whatever half-finished decode
+// state drawImage(video) grabbed once its stall timer tripped had no reliable relationship to
+// the frame actually being requested - it just showed whatever the browser's own seek
+// implementation happened to be sitting on, which is how "choppy and jumping to completely
+// different places in the video" happens. Once a layer has a working LiveTimeRemapDecoder,
+// the fix is to never let that unreliable path draw for it again: on a cache miss, keep
+// showing the last frame THIS decoder actually finished decoding (a real, correct frame from
+// slightly earlier in the ramp) instead of reaching for a different, unrelated frame source.
+// A hold looks like a brief stutter; the old fallback looked like random footage.
 function requestLiveTimeRemapFrame(decoder: LiveTimeRemapDecoder, frame: number, targetTime: number, onResolved: () => void) {
   decoder.desiredFrame = frame;
   decoder.desiredTargetTime = targetTime;
@@ -784,6 +807,9 @@ function requestLiveTimeRemapFrame(decoder: LiveTimeRemapDecoder, frame: number,
           const evicted = decoder.cacheOrder.shift();
           if (evicted !== undefined) decoder.cache.delete(evicted);
         }
+        // A decode that returned null (timestamp before the track's first sample) isn't a
+        // "good" frame to hold onto - leave lastResolvedCanvas at whatever it was before.
+        if (canvas) decoder.lastResolvedCanvas = canvas;
         onResolved();
         if (decoder.desiredFrame !== nextFrame) runNext();
         else decoder.pendingFrame = null;
@@ -2943,6 +2969,7 @@ export function CompositionCanvas() {
             desiredFrame: null,
             desiredTargetTime: null,
             disposed: false,
+            lastResolvedCanvas: null,
           });
           setLiveTimeRemapVersion((version) => version + 1);
         } catch (error) {
@@ -3317,10 +3344,14 @@ export function CompositionCanvas() {
     // Every Time Remapped layer with an open decoder gets its exact-frame lookup done here,
     // once per render pass, so drawLayerContent only ever needs a synchronous map read (see
     // liveTimeRemapFrames on RenderCompositionFrameOptions). A cache miss kicks off the async
-    // decode in the background (requestLiveTimeRemapFrame) without blocking this draw - this
-    // tick falls back to the live <video> element via the existing path, and the resolved
-    // frame bumps liveTimeRemapVersion, which is in this effect's own dependency list below,
-    // so the very next render pass (whether or not playheadFrame has also changed) picks it up.
+    // decode in the background (requestLiveTimeRemapFrame) without blocking this draw. Rather
+    // than falling back to the live <video> element on a miss, this holds the decoder's own
+    // lastResolvedCanvas - see the long comment on requestLiveTimeRemapFrame for why: once a
+    // decoder is up and running, it's the ONLY source of pixels this layer ever draws from, so
+    // a fast/reversed ramp that briefly outruns decoding holds its last real frame instead of
+    // flashing whatever the native element's own seek happened to be sitting on. The resolved
+    // frame bumps liveTimeRemapVersion, which is in this effect's own dependency list below, so
+    // the very next render pass (whether or not playheadFrame has also changed) picks it up.
     const liveTimeRemapFrames = new Map<string, WrappedCanvas | null>();
     const compositionFps = finiteNumber(composition.fps, 30);
     liveTimeRemapDecoders.current.forEach((decoder, layerId) => {
@@ -3331,6 +3362,7 @@ export function CompositionCanvas() {
       const targetTime = mediaTimeForFrame(layer, playheadFrame, compositionFps, sourceDuration);
       const cached = decoder.cache.get(playheadFrame);
       if (cached !== undefined) liveTimeRemapFrames.set(layerId, cached);
+      else if (decoder.lastResolvedCanvas) liveTimeRemapFrames.set(layerId, decoder.lastResolvedCanvas);
       if (decoder.desiredFrame !== playheadFrame) {
         requestLiveTimeRemapFrame(decoder, playheadFrame, targetTime, () => setLiveTimeRemapVersion((version) => version + 1));
       }
