@@ -46,7 +46,6 @@ function projectFromPayload(payload: unknown) {
 }
 
 export default function App() {
-  const frameRemainder = useRef(0);
   const playheadFrameRef = useRef(0);
   const splashProjectInputRef = useRef<HTMLInputElement | null>(null);
   const [showSplash, setShowSplash] = useState(true);
@@ -80,31 +79,44 @@ export default function App() {
   useEffect(() => {
     if (!isPlaying || !composition || showSplash) return;
     let animationFrame = 0;
-    let lastTime = performance.now();
-    frameRemainder.current = 0;
     const fps = Math.max(1, Math.round(typeof composition.fps === "number" && Number.isFinite(composition.fps) ? composition.fps : 30));
     const durationFrames = Math.max(1, Math.round(typeof composition.durationFrames === "number" && Number.isFinite(composition.durationFrames) ? composition.durationFrames : 300));
+    // Wall-clock-derived playhead, the same technique real NLEs use for interactive playback
+    // (After Effects, DaVinci Resolve, Apple Color): the playhead is always wherever real
+    // elapsed time says it should be, computed fresh from performance.now() every tick rather
+    // than accumulated frame-by-frame - so a slow frame can never make the clock itself fall
+    // behind. See https://creativecow.net/forums/thread/real-timedropped-frames-playback-optionae/
+    // for editors independently converging on exactly this tradeoff: Resolve's own "play every
+    // frame" mode does the opposite (advance by exactly one frame per tick, however long that
+    // takes) and users report it as "butt-numbingly slow" once a frame is expensive to render -
+    // which is exactly what this project's previous version of this loop did on purpose, and
+    // exactly why. That approach also broke video-layer sync in a way real-time frame dropping
+    // doesn't: every <video> element in the composition (see the live-preview sync effect in
+    // CompositionCanvas.tsx) plays on its own native real-time clock regardless of how the
+    // playhead advances, so throttling the playhead to "however long rendering takes" just
+    // means the reference every layer is supposed to be tracking keeps falling further behind
+    // real time - which is what was actually behind both the "jumping" and "layers playing at
+    // different speeds" reports: the video elements were racing ahead of an artificially
+    // slowed-down target, at whatever different rate each layer's own decoder happened to drift.
+    // A wall-clock playhead never falls behind, so there's no gap for video layers to race
+    // ahead of in the first place - and it means dropped/skipped composition frames during a
+    // heavy stretch (frames that were too expensive to fully render in their real-time budget
+    // simply aren't drawn, the same "dropped frames" indicator every pro NLE has), rather than
+    // played back in slow motion.
+    const startTime = performance.now();
+    const startFrame = playheadFrameRef.current;
+    let lastFrame = startFrame;
     const tick = (time: number) => {
-      const elapsed = (time - lastTime) / 1000;
-      lastTime = time;
-      frameRemainder.current += elapsed * fps;
-      // Only ever step the playhead forward by ONE composition frame per tick, even if
-      // `elapsed` says several frames' worth of real time have passed. Composition frames
-      // with a lot of per-frame work (imported video plus several pixel-processing effects
-      // like curves/hue-saturation/sharpen, which each do a synchronous getImageData pass)
-      // can easily take longer to render than the nominal 1000/fps budget - previously,
-      // that made the NEXT tick's `elapsed` large, so wholeFrames jumped by several frames
-      // at once to "catch up" to real time, which meant those in-between frames were never
-      // rendered at all. That's what produced the choppy playback and the sense that frames
-      // were being skipped/missing: they genuinely were. Any leftover accumulated time stays
-      // in frameRemainder and keeps advancing the playhead one frame at a time on
-      // subsequent ticks, so heavy stretches make playback run slower than real-time
-      // instead of dropping frames - every composition frame still gets rendered, in order.
-      const wholeFrames = Math.min(1, Math.floor(frameRemainder.current));
-      if (wholeFrames > 0) {
-        frameRemainder.current -= wholeFrames;
-        const nextFrame = playheadFrameRef.current + wholeFrames;
-        const wrappedFrame = nextFrame >= durationFrames ? nextFrame % durationFrames : nextFrame;
+      const elapsedSeconds = (time - startTime) / 1000;
+      const framesAdvanced = Math.round(elapsedSeconds * fps);
+      const rawFrame = startFrame + framesAdvanced;
+      // Proper modulo (not `%`, which can return a value up to `durationFrames - 1` short of
+      // wrapping correctly once framesAdvanced spans more than one full loop under a long
+      // heavy stretch) so looped playback always lands on the exact right frame regardless of
+      // how many loops real time has actually covered.
+      const wrappedFrame = ((rawFrame % durationFrames) + durationFrames) % durationFrames;
+      if (wrappedFrame !== lastFrame) {
+        lastFrame = wrappedFrame;
         playheadFrameRef.current = wrappedFrame;
         setPlayheadFrame(wrappedFrame);
       }
