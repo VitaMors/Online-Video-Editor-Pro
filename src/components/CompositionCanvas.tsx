@@ -689,6 +689,39 @@ function rememberVideoFrame(videoUrl: string, video: HTMLVideoElement, width: nu
   context.drawImage(video, 0, 0, pixelWidth, pixelHeight);
   videoFrameCache.set(cacheKey, { canvas, width: pixelWidth, height: pixelHeight });
 }
+
+// A layer with Time Remapping on can never use native <video>.play() (see canUseLivePlayback in
+// the live-sync effect below) - every composition frame reseeks the element to whatever source
+// time the remap curve maps to, and drawLayerContent (immediately below) deliberately shows the
+// last known-good cached frame rather than the live element while a seek is still in flight, so
+// scrubbing doesn't flash a stale pre-seek frame. That trade-off is fine for scrubbing, where
+// seeks are occasional and resolve in well under a frame. It stops being fine for continuous
+// Time Remap PLAYBACK under real render load (multiple video layers, an adjustment layer running
+// Levels + Gaussian Blur): every single composition frame issues a fresh seek, and if the main
+// thread is busy compositing those effects for long enough that a seek doesn't resolve before
+// the NEXT frame's draw, video.seeking is true at literally every sample - so the cache never
+// gets refreshed past whichever frame happened to land first, and playback looks like a dead
+// freeze-frame even though the underlying <video> element's currentTime is quietly tracking the
+// remap curve correctly the whole time (confirmed while diagnosing this: currentTime advances
+// exactly as expected, only the drawn pixels don't). videoSeekStallStartedAt tracks, per source
+// url, how long the CURRENT seek has been pending; once it's been stuck for longer than a person
+// would read as "still catching up" rather than "frozen," drawLayerContent draws the live element
+// anyway - a frame that's a little behind its exact target beats a frame that never changes.
+const videoSeekStallStartedAt = new Map<string, number>();
+const VIDEO_SEEK_STALL_DRAW_ANYWAY_MS = 200;
+
+function videoSeekStallMs(videoUrl: string, seeking: boolean, now: number) {
+  if (!seeking) {
+    videoSeekStallStartedAt.delete(videoUrl);
+    return 0;
+  }
+  const startedAt = videoSeekStallStartedAt.get(videoUrl);
+  if (startedAt === undefined) {
+    videoSeekStallStartedAt.set(videoUrl, now);
+    return 0;
+  }
+  return now - startedAt;
+}
 function drawLayerContent(
   context: CanvasRenderingContext2D,
   composition: Composition,
@@ -790,8 +823,15 @@ function drawLayerContent(
 
     // While a seek is in flight the video element still displays its pre-seek frame, so
     // drawing it here would flash the wrong frame during scrubbing/timeline dragging.
-    // Prefer the last known-good cached frame until the seek actually resolves.
-    if (video && video.readyState >= 2 && video.videoWidth > 0 && !video.seeking) {
+    // Prefer the last known-good cached frame until the seek actually resolves - UNLESS this
+    // seek has been pending long enough that it's no longer "about to resolve" (see
+    // videoSeekStallMs above): that's what a Time Remapped layer's continuous per-frame
+    // reseeking looks like once heavy effects on the same composition are slow enough to starve
+    // it, and refusing to ever draw a mid-seek frame there is what turns into a permanent freeze
+    // rather than merely-imperfect playback.
+    const seeking = video?.seeking ?? false;
+    const seekStalled = video ? videoSeekStallMs(source.videoUrl, seeking, performance.now()) > VIDEO_SEEK_STALL_DRAW_ANYWAY_MS : false;
+    if (video && video.readyState >= 2 && video.videoWidth > 0 && (!seeking || seekStalled)) {
       try {
         context.drawImage(video, 0, 0, width, height);
         rememberVideoFrame(source.videoUrl, video, width, height);

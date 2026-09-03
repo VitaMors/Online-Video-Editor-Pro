@@ -455,6 +455,38 @@ function timeRemapValueAt(layer: Layer, frame: number, fps: number) {
   const property = layer.source?.timeRemap;
   return property ? evaluateProperty(property, frame) : sourceTimeAtFrame(layer, frame, fps);
 }
+
+// Enabling Time Remapping (toggleTimeRemap, above) eagerly bakes two keyframes spanning the
+// layer's bounds at that exact moment, via createTimeRemapProperty. Two things can move those
+// bounds out from under that curve afterward without anyone touching the curve itself: (1) a
+// freshly-imported clip's endFrame defaults to the full composition span (see createLayer in
+// factories.ts) and only shrinks to the media's real length once its metadata finishes loading
+// (updateMediaLayerDuration) - enable Time Remapping before that resolves (importing and
+// immediately remapping is a completely ordinary thing to do) and the end keyframe's value gets
+// computed from the not-yet-corrected span instead of the real source duration; (2) dragging a
+// clip's edge to retime it (setLayerTiming) or sliding it along the timeline (moveLayerTiming)
+// after Time Remapping is already on. Either way the curve's end keyframe ends up requesting a
+// source time far past what the source actually has, mediaTimeForFrame's own duration clamp
+// (see CompositionCanvas.tsx) pins the result at the source's last frame, and every composition
+// frame from wherever that clamp kicks in onward keeps re-requesting the same clamped time -
+// which is what a genuine "press play and it just freeze-frames" report looks like: real
+// playback for the clip's actual length, then a static hold for however much of the layer's
+// span is left. isDefaultTimeRemapProperty recognizes a curve that's still exactly what
+// createTimeRemapProperty produces (nobody has hand-edited a keyframe on it yet), so the three
+// call sites below can safely regenerate it to track the layer's current bounds - a curve the
+// user has actually customized is left alone rather than silently clobbered.
+function isDefaultTimeRemapProperty(property: AnimatableProperty<number> | undefined): property is AnimatableProperty<number> {
+  if (!property || property.keyframes.length < 1 || property.keyframes.length > 2) return false;
+  return property.keyframes.every((keyframe) => (
+    keyframe.interpolation === "linear" &&
+    keyframe.easeIn === 0 &&
+    keyframe.easeOut === 0 &&
+    keyframe.velocityIn === 0 &&
+    keyframe.velocityOut === 0 &&
+    !keyframe.velocityInComponents &&
+    !keyframe.velocityOutComponents
+  ));
+}
 function readImageDimensions(url: string) {
   return new Promise<{ width: number; height: number }>((resolve, reject) => {
     const image = new Image();
@@ -966,11 +998,22 @@ export const useEditorStore = create<EditorState>()(
           if (layer.endFrame === endFrame && layer.source?.mediaDurationFrames === durationFrames) return {};
 
           return {
-            project: updateLayer(state, layerId, (currentLayer) => ({
-              ...currentLayer,
-              endFrame,
-              source: { ...currentLayer.source, mediaDurationFrames: durationFrames },
-            })),
+            project: updateLayer(state, layerId, (currentLayer) => {
+              const nextLayer = {
+                ...currentLayer,
+                endFrame,
+                source: { ...currentLayer.source, mediaDurationFrames: durationFrames },
+              };
+              // See isDefaultTimeRemapProperty above: this metadata (real endFrame, real source
+              // duration) usually wasn't known yet when Time Remapping was enabled, so an
+              // untouched default curve needs redoing now that the real numbers are in - not
+              // doing this is what produces a freeze-frame the moment the earlier, wrong curve's
+              // clamp point arrives.
+              if (currentLayer.type === "video" && isDefaultTimeRemapProperty(currentLayer.source?.timeRemap)) {
+                return { ...nextLayer, source: { ...nextLayer.source, timeRemap: createTimeRemapProperty(nextLayer, safeFps) } };
+              }
+              return nextLayer;
+            }),
           };
         }),
       // Media is only ever referenced by a blob: URL (nothing about the actual file gets
@@ -1464,6 +1507,7 @@ export const useEditorStore = create<EditorState>()(
 
           if (safeStart === currentStart && nextEnd === currentEnd) return {};
 
+          const safeFpsForRemap = Math.max(1, Math.round(finiteNumber(composition.fps, 30)));
           return {
             project: updateLayer(state, layerId, (currentLayer) => {
               const startDelta = safeStart - currentStart;
@@ -1475,7 +1519,15 @@ export const useEditorStore = create<EditorState>()(
                   }
                 : currentLayer.source;
 
-              return { ...currentLayer, startFrame: safeStart, endFrame: nextEnd, source };
+              const retimedLayer = { ...currentLayer, startFrame: safeStart, endFrame: nextEnd, source };
+              // See isDefaultTimeRemapProperty above: dragging a clip's edge after Time
+              // Remapping is already on (a completely normal way to set up slow motion - remap
+              // first, then stretch the out point) needs the curve's end keyframe to follow the
+              // new out point, or the stretched portion just freezes on the old clamp value.
+              if (currentLayer.type === "video" && isDefaultTimeRemapProperty(currentLayer.source?.timeRemap)) {
+                return { ...retimedLayer, source: { ...retimedLayer.source, timeRemap: createTimeRemapProperty(retimedLayer, safeFpsForRemap) } };
+              }
+              return retimedLayer;
             }),
           };
         }),
@@ -1494,13 +1546,25 @@ export const useEditorStore = create<EditorState>()(
           const nextEnd = Math.min(durationFrames, nextStart + layerDuration);
 
           if (nextStart === currentStart && nextEnd === currentEnd) return {};
+          const moveDelta = nextStart - currentStart;
 
           return {
-            project: updateLayer(state, layerId, (currentLayer) => ({
-              ...currentLayer,
-              startFrame: nextStart,
-              endFrame: nextEnd,
-            })),
+            project: updateLayer(state, layerId, (currentLayer) => {
+              const movedLayer = { ...currentLayer, startFrame: nextStart, endFrame: nextEnd };
+              // See isDefaultTimeRemapProperty above: a pure slide doesn't change how long the
+              // clip plays, just where - so shift the curve's keyframes by the same delta rather
+              // than recomputing their values, keeping the remap pinned to the clip instead of
+              // being left behind at the old timeline position (which would misalign it with
+              // the layer's new active window).
+              if (currentLayer.type === "video" && isDefaultTimeRemapProperty(currentLayer.source?.timeRemap) && currentLayer.source?.timeRemap) {
+                const shiftedTimeRemap = {
+                  ...currentLayer.source.timeRemap,
+                  keyframes: currentLayer.source.timeRemap.keyframes.map((keyframe) => ({ ...keyframe, frame: keyframe.frame + moveDelta })),
+                };
+                return { ...movedLayer, source: { ...movedLayer.source, timeRemap: shiftedTimeRemap } };
+              }
+              return movedLayer;
+            }),
           };
         }),      splitSelectedLayers: () =>
         set((state) => {
