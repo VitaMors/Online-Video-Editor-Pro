@@ -1,7 +1,10 @@
 import { ChevronDown, ChevronRight, Clock3, Copy, Gauge, LocateFixed, Maximize2, Scissors, Trash2 } from "lucide-react";
 import { useMemo, useRef, useState } from "react";
+import type React from "react";
+import { ContextMenu, useContextMenu } from "./ContextMenu";
 import { propertyLabel } from "../lib/animation";
 import { effectControlDefinition, effectDefinition, isEffectNumberControl } from "../lib/effects";
+import { buildLayerContextMenu } from "../lib/layerContextMenu";
 import { useEditorStore } from "../store/editorStore";
 import type { Effect, EffectPropertyKey, Layer, Mask, MaskPropertyKey, TransformPropertyKey } from "../types/editor";
 
@@ -105,6 +108,25 @@ export function Timeline({ mobile = false }: TimelineProps) {
   const deleteSelection = useEditorStore((state) => state.deleteSelection);
   const splitSelectedLayers = useEditorStore((state) => state.splitSelectedLayers);
   const setGraphMode = useEditorStore((state) => state.setGraphMode);
+  const duplicateLayer = useEditorStore((state) => state.duplicateLayer);
+  const toggleLayerFlag = useEditorStore((state) => state.toggleLayerFlag);
+  const setLayerBlendMode = useEditorStore((state) => state.setLayerBlendMode);
+  const toggleTimeRemap = useEditorStore((state) => state.toggleTimeRemap);
+  const freezeTimeRemap = useEditorStore((state) => state.freezeTimeRemap);
+  const reverseTimeRemap = useEditorStore((state) => state.reverseTimeRemap);
+  const reorderLayer = useEditorStore((state) => state.reorderLayer);
+  const addEffect = useEditorStore((state) => state.addEffect);
+  const layerContextMenu = useContextMenu();
+
+  const openLayerContextMenu = (event: React.MouseEvent, layer: Layer) => {
+    if (!selectedLayerIds.includes(layer.id)) selectLayer(layer.id);
+    if (!composition) return;
+    layerContextMenu.open(event, buildLayerContextMenu(layer, composition, {
+      duplicateLayer, splitSelectedLayers, deleteSelection, toggleLayerFlag,
+      setLayerBlendMode, toggleTimeRemap, freezeTimeRemap, reverseTimeRemap,
+      reorderLayer, addEffect,
+    }));
+  };
 
   const rows = useMemo<TimelineRow[]>(() => {
     if (!composition) return [];
@@ -213,7 +235,7 @@ export function Timeline({ mobile = false }: TimelineProps) {
                 const selected = rowSelected(row);
                 const expanded = expandedLayerIds.includes(row.layer.id);
                 return (
-                  <button key={key} className={`flex h-7 w-full items-center gap-2 border-b border-editor-line/70 px-3 text-left text-[12px] ${selected ? "bg-cyan-950/35 text-editor-cyan" : "text-editor-muted"}`} onClick={() => selectRow(row)}>
+                  <button key={key} className={`flex h-7 w-full items-center gap-2 border-b border-editor-line/70 px-3 text-left text-[12px] ${selected ? "bg-cyan-950/35 text-editor-cyan" : "text-editor-muted"}`} onClick={() => selectRow(row)} onContextMenu={(event) => { if (row.kind === "layer") openLayerContextMenu(event, row.layer); }}>
                     {row.kind === "layer" ? (
                       <span className="flex h-5 w-5 items-center justify-center" onClick={(event) => { event.stopPropagation(); setExpandedLayerIds((current) => current.includes(row.layer.id) ? current.filter((id) => id !== row.layer.id) : [...current, row.layer.id]); }}>
                         {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
@@ -298,7 +320,12 @@ export function Timeline({ mobile = false }: TimelineProps) {
                           rx={3}
                           cursor={row.layer.locked ? "default" : "grab"}
                           onPointerDown={(event) => {
-                            if (row.layer.locked) return;
+                            // Right-click (button 2) should only ever open the context menu below,
+                            // never also arm a drag - without this check, pointerdown fires for
+                            // every mouse button, so a right-click would select the layer and enter
+                            // layerMove drag state a beat before the browser's contextmenu event
+                            // (which fires on release, not press) had a chance to open our menu.
+                            if (row.layer.locked || event.button !== 0) return;
                             event.preventDefault();
                             event.stopPropagation();
                             selectLayer(row.layer.id);
@@ -307,6 +334,7 @@ export function Timeline({ mobile = false }: TimelineProps) {
                             setDragging({ type: "layerMove", layerId: row.layer.id, startPointerFrame, startFrame: row.layer.startFrame, endFrame: row.layer.endFrame });
                             svg?.setPointerCapture(event.pointerId);
                           }}
+                          onContextMenu={(event) => openLayerContextMenu(event, row.layer)}
                         />
                         <rect
                           x={layerStartX}
@@ -392,6 +420,7 @@ export function Timeline({ mobile = false }: TimelineProps) {
           </svg>
         </div>
       </div>
+      <ContextMenu state={layerContextMenu.state} onClose={layerContextMenu.close} />
     </section>
   );
 }

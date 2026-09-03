@@ -113,6 +113,12 @@ type EditorState = {
   setLayerTiming: (layerId: string, startFrame: number, endFrame: number) => void;
   moveLayerTiming: (layerId: string, startFrame: number) => void;
   splitSelectedLayers: () => void;
+  // With no layerId, duplicates every currently selected layer (used by the Ctrl/Cmd+D
+  // shortcut and the Layer menu, matching After Effects' Edit > Duplicate). With a layerId -
+  // used by the layer context menu, so right-clicking a layer that isn't the current selection
+  // still duplicates the one actually clicked - it duplicates just that layer regardless of
+  // what's currently selected.
+  duplicateLayer: (layerId?: string) => void;
   selectLayer: (layerId: string, additive?: boolean) => void;
   selectProperty: (property: TransformPropertyKey) => void;
   selectKeyframe: (keyframeId: string, additive?: boolean) => void;
@@ -1598,6 +1604,41 @@ export const useEditorStore = create<EditorState>()(
       selectedSourceProperty: undefined,
       selectedEffectId: undefined,
       selectedEffectProperty: undefined,
+          };
+        }),
+      duplicateLayer: (layerId) =>
+        set((state) => {
+          const composition = activeComposition(state);
+          if (!composition) return {};
+
+          const targetIds = new Set(layerId ? [layerId] : state.selectedLayerIds);
+          if (targetIds.size === 0) return {};
+
+          const duplicateIds: string[] = [];
+
+          return {
+            project: updateActiveComposition(state, (layers) => layers.flatMap((layer) => {
+              if (!targetIds.has(layer.id)) return [layer];
+              // cloneLayerSegment already does exactly what a duplicate needs: a fresh layer
+              // id plus deep-cloned (fresh-id) transform keyframes, masks and effects, and
+              // time remap curve - it's the same helper splitSelectedLayers above uses to spin
+              // off the right-hand half of a split. Passing the layer's own full start/end span
+              // (instead of a sub-range) makes it a complete duplicate rather than a segment.
+              const duplicate = cloneLayerSegment(layer, layer.startFrame, layer.endFrame);
+              duplicateIds.push(duplicate.id);
+              // After Effects' Edit > Duplicate inserts the copy directly above (in front of)
+              // the original, in the same stacking position the original was in, and selects
+              // only the new duplicate(s) - the original stays exactly where it was, just one
+              // slot further back.
+              return [duplicate, layer];
+            })),
+            selectedLayerIds: duplicateIds,
+            selectedKeyframeIds: [],
+            selectedMaskId: undefined,
+            selectedMaskProperty: undefined,
+            selectedSourceProperty: undefined,
+            selectedEffectId: undefined,
+            selectedEffectProperty: undefined,
           };
         }),
       selectLayer: (layerId, additive) =>

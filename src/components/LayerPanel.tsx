@@ -1,8 +1,10 @@
 import { Box, Camera, ChevronRight, Eye, EyeOff, Image, Lock, Menu, Music, SlidersHorizontal, Square, Type, Unlock, Video, Wind } from "lucide-react";
 import { useState } from "react";
-import type { DragEvent } from "react";
+import type { DragEvent, MouseEvent as ReactMouseEvent } from "react";
+import { ContextMenu, useContextMenu } from "./ContextMenu";
+import { buildLayerContextMenu } from "../lib/layerContextMenu";
 import { useEditorStore } from "../store/editorStore";
-import type { LayerType } from "../types/editor";
+import type { Layer, LayerType } from "../types/editor";
 
 const layerIcons: Record<LayerType, typeof Square> = {
   text: Type,
@@ -43,6 +45,29 @@ export function LayerPanel({ mobile = false }: LayerPanelProps) {
   const setParentLayer = useEditorStore((state) => state.setParentLayer);
   const renameLayer = useEditorStore((state) => state.renameLayer);
   const reorderLayer = useEditorStore((state) => state.reorderLayer);
+  const duplicateLayer = useEditorStore((state) => state.duplicateLayer);
+  const splitSelectedLayers = useEditorStore((state) => state.splitSelectedLayers);
+  const deleteSelection = useEditorStore((state) => state.deleteSelection);
+  const setLayerBlendMode = useEditorStore((state) => state.setLayerBlendMode);
+  const toggleTimeRemap = useEditorStore((state) => state.toggleTimeRemap);
+  const freezeTimeRemap = useEditorStore((state) => state.freezeTimeRemap);
+  const reverseTimeRemap = useEditorStore((state) => state.reverseTimeRemap);
+  const addEffect = useEditorStore((state) => state.addEffect);
+  const layerContextMenu = useContextMenu();
+
+  const openLayerContextMenu = (event: ReactMouseEvent, layer: Layer) => {
+    // Right-clicking a layer that isn't part of the current selection collapses the selection
+    // to just that layer first - the same thing After Effects' own Timeline panel does, so the
+    // menu that opens always acts on whatever you actually clicked rather than some other,
+    // unrelated selection left over from earlier.
+    if (!selectedLayerIds.includes(layer.id)) selectLayer(layer.id);
+    if (!composition) return;
+    layerContextMenu.open(event, buildLayerContextMenu(layer, composition, {
+      duplicateLayer, splitSelectedLayers, deleteSelection, toggleLayerFlag,
+      setLayerBlendMode, toggleTimeRemap, freezeTimeRemap, reverseTimeRemap,
+      reorderLayer, addEffect,
+    }));
+  };
 
   if (!composition) return null;
 
@@ -64,6 +89,7 @@ export function LayerPanel({ mobile = false }: LayerPanelProps) {
               key={layer.id}
               className={`grid grid-cols-[20px_28px_28px_28px_28px_minmax(0,1fr)] items-center gap-1 px-2 py-2 transition ${droppingAbove ? "border-t-2 border-t-editor-cyan" : ""} ${droppingBelow ? "border-b-2 border-b-editor-cyan" : "border-b border-editor-line/70"} ${activeDrag ? "opacity-55" : selected ? "bg-cyan-950/35" : "hover:bg-editor-panel2"}`}
               onClick={() => selectLayer(layer.id)}
+              onContextMenu={(event) => openLayerContextMenu(event, layer)}
               onDragOver={(event) => {
                 if (!dragLayerId || dragLayerId === layer.id) return;
                 event.preventDefault();
@@ -134,6 +160,7 @@ export function LayerPanel({ mobile = false }: LayerPanelProps) {
           );
         })}
       </div>
+      <ContextMenu state={layerContextMenu.state} onClose={layerContextMenu.close} />
     </aside>
   );
 }

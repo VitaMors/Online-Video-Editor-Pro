@@ -204,6 +204,7 @@ export function MenuBar() {
   const pasteKeyframes = useEditorStore((state) => state.pasteKeyframes);
   const deleteSelection = useEditorStore((state) => state.deleteSelection);
   const splitSelectedLayers = useEditorStore((state) => state.splitSelectedLayers);
+  const duplicateLayer = useEditorStore((state) => state.duplicateLayer);
   const addEffect = useEditorStore((state) => state.addEffect);
   const toggleTimeRemap = useEditorStore((state) => state.toggleTimeRemap);
   const freezeTimeRemap = useEditorStore((state) => state.freezeTimeRemap);
@@ -392,6 +393,7 @@ export function MenuBar() {
       { label: "New Adjustment Layer", action: layerAction("adjustment") },
       { label: "New Null Layer", action: layerAction("null") },
       { label: "New Camera Layer", action: layerAction("camera") },
+      { label: "Duplicate Layer", action: () => duplicateLayer(), disabled: selectedLayerIds.length === 0 },
       { label: "Split Layer", action: splitSelectedLayers },
       { label: selectedVideoLayer?.source?.timeRemap ? "Disable Time Remapping" : "Enable Time Remapping", action: () => selectedVideoLayer && toggleTimeRemap(selectedVideoLayer.id), disabled: !selectedVideoLayer },
       { label: "Freeze Frame", action: () => selectedVideoLayer && freezeTimeRemap(selectedVideoLayer.id), disabled: !selectedVideoLayer },

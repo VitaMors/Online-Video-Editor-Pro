@@ -67,6 +67,7 @@ export default function App() {
   const copySelection = useEditorStore((state) => state.copySelection);
   const pasteKeyframes = useEditorStore((state) => state.pasteKeyframes);
   const splitSelectedLayers = useEditorStore((state) => state.splitSelectedLayers);
+  const duplicateLayer = useEditorStore((state) => state.duplicateLayer);
   const previousKeyframe = useEditorStore((state) => state.previousKeyframe);
   const nextKeyframe = useEditorStore((state) => state.nextKeyframe);
   const selectProperty = useEditorStore((state) => state.selectProperty);
@@ -144,6 +145,9 @@ export default function App() {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") { event.preventDefault(); event.shiftKey ? redo() : undo(); return; }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "y") { event.preventDefault(); redo(); return; }
       if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "d") { event.preventDefault(); splitSelectedLayers(); return; }
+      // After Effects' own Duplicate shortcut - Ctrl/Cmd+D with no Shift, so it never collides
+      // with Split Layer (Ctrl/Cmd+Shift+D) right above.
+      if ((event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === "d") { event.preventDefault(); duplicateLayer(); return; }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c") copySelection();
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "v") pasteKeyframes();
       if (event.key.toLowerCase() === "j") previousKeyframe();
@@ -154,7 +158,7 @@ export default function App() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [copySelection, deleteSelection, nextKeyframe, pasteKeyframes, playheadFrame, previousKeyframe, redo, selectProperty, setPlayback, setPlayheadFrame, showSplash, splitSelectedLayers, togglePlayback, undo]);
+  }, [copySelection, deleteSelection, duplicateLayer, nextKeyframe, pasteKeyframes, playheadFrame, previousKeyframe, redo, selectProperty, setPlayback, setPlayheadFrame, showSplash, splitSelectedLayers, togglePlayback, undo]);
 
 
   const chooseLayoutMode = (mode: EditorLayoutMode) => {
