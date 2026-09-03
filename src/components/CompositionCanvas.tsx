@@ -722,6 +722,82 @@ function videoSeekStallMs(videoUrl: string, seeking: boolean, now: number) {
   }
   return now - startedAt;
 }
+
+// videoSeekStallMs above helps when a seek would have resolved quickly if the main thread
+// weren't busy compositing effects, but it can't help when the seek itself is just slow: a
+// native <video> element seeking to an arbitrary/distant timestamp in a longer source file
+// (especially one with widely-spaced keyframes, like a screen recording) can genuinely take
+// well over a second to decode forward from the last keyframe to the target frame, no matter
+// how idle the main thread is - and a browser doesn't reveal any new pixels for an in-progress
+// seek, so forcing an early drawImage(video) during one just keeps showing the same stale
+// pre-seek frame anyway. That's what turns into the "frozen for ~1-2s, then hard-cuts to a new
+// frame" pattern under real Time Remap playback, as opposed to the smoother main-thread-starved
+// stalls videoSeekStallMs recovers from. This is architecturally the exact same problem export
+// already solved (see buildExportVideoDecoders/exportFrameLocked branch below): read exact
+// frames straight out of a dedicated mediabunny/WebCodecs decoder by timestamp, which has no
+// seek-latency gap at all, instead of trusting a live element's seek to have already resolved.
+// LiveTimeRemapDecoder is that same decoder, kept open and reused across ticks (one per
+// time-remapped video layer, managed by a reconciliation effect in CompositionCanvas()) rather
+// than opened once per export - so `cache` holds only the handful of composition frames it's
+// actually been asked for recently rather than every output frame up front.
+type LiveTimeRemapDecoder = {
+  input: Input;
+  sink: CanvasSink;
+  videoUrl: string;
+  // Keyed by composition `frame` number (not float seconds) so a lookup during drawing is an
+  // exact match against the same `frame` renderCompositionFrame is already drawing.
+  cache: Map<number, WrappedCanvas | null>;
+  cacheOrder: number[];
+  pendingFrame: number | null;
+  desiredFrame: number | null;
+  desiredTargetTime: number | null;
+  disposed: boolean;
+};
+
+const LIVE_TIME_REMAP_CACHE_LIMIT = 90;
+
+// getCanvas() calls against the same underlying WebCodecs decoder aren't safe to run
+// concurrently, so only one is ever in flight per decoder at a time. If the desired frame
+// changes again while one is already pending (the playhead advances every tick during
+// playback), the newer request just overwrites desiredFrame/desiredTargetTime and gets picked
+// up as soon as the in-flight one resolves - rather than queuing every intermediate frame,
+// which would only fall further and further behind real time under sustained playback.
+function requestLiveTimeRemapFrame(decoder: LiveTimeRemapDecoder, frame: number, targetTime: number, onResolved: () => void) {
+  decoder.desiredFrame = frame;
+  decoder.desiredTargetTime = targetTime;
+  if (decoder.pendingFrame !== null) return;
+
+  const runNext = () => {
+    const nextFrame = decoder.desiredFrame;
+    const nextTime = decoder.desiredTargetTime;
+    if (decoder.disposed || nextFrame === null || nextTime === null) {
+      decoder.pendingFrame = null;
+      return;
+    }
+    decoder.pendingFrame = nextFrame;
+    decoder.sink.getCanvas(nextTime)
+      .then((canvas) => {
+        if (decoder.disposed) return;
+        decoder.cache.set(nextFrame, canvas);
+        decoder.cacheOrder.push(nextFrame);
+        while (decoder.cacheOrder.length > LIVE_TIME_REMAP_CACHE_LIMIT) {
+          const evicted = decoder.cacheOrder.shift();
+          if (evicted !== undefined) decoder.cache.delete(evicted);
+        }
+        onResolved();
+        if (decoder.desiredFrame !== nextFrame) runNext();
+        else decoder.pendingFrame = null;
+      })
+      .catch((error: unknown) => {
+        if (decoder.disposed) return;
+        console.error(`Live time-remap decode failed for frame ${nextFrame}:`, error);
+        decoder.cache.set(nextFrame, null);
+        if (decoder.desiredFrame !== nextFrame) runNext();
+        else decoder.pendingFrame = null;
+      });
+  };
+  runNext();
+}
 function drawLayerContent(
   context: CanvasRenderingContext2D,
   composition: Composition,
@@ -734,6 +810,7 @@ function drawLayerContent(
   activeCamera?: Layer,
   exportFrameLocked = false,
   exportVideoFrames?: ExportVideoFrames,
+  liveTimeRemapFrames?: Map<string, WrappedCanvas | null>,
 ) {
   const [width, height] = getLayerSize(layer);
   const source = layer.source;
@@ -819,6 +896,20 @@ function drawLayerContent(
         }
       }
       return;
+    }
+
+    // Time Remapped layers: prefer an exact WebCodecs-decoded frame for this precise
+    // composition frame (see LiveTimeRemapDecoder above) over the live <video> element's
+    // seek-and-draw path below. Falls through to that path when the decoder hasn't produced
+    // this exact frame yet (still initializing, or the request just went out this tick) -
+    // requestLiveTimeRemapFrame runs the decode in the background and the next natural
+    // re-render (playheadFrame changes every tick during playback) picks it up once resolved.
+    if (source.timeRemap && liveTimeRemapFrames) {
+      const decodedFrame = liveTimeRemapFrames.get(layer.id);
+      if (decodedFrame) {
+        context.drawImage(decodedFrame.canvas, 0, 0, width, height);
+        return;
+      }
     }
 
     // While a seek is in flight the video element still displays its pre-seek frame, so
@@ -1533,6 +1624,7 @@ function drawMaskedLayerContent(
   activeCamera?: Layer,
   exportFrameLocked = false,
   exportVideoFrames?: ExportVideoFrames,
+  liveTimeRemapFrames?: Map<string, WrappedCanvas | null>,
 ) {
   const [width, height] = getLayerSize(layer);
   const effectPadding = glowSpreadPadding(layer, frame);
@@ -1540,13 +1632,13 @@ function drawMaskedLayerContent(
   const contentContext = contentCanvas.getContext("2d");
 
   if (!contentContext) {
-    drawLayerContent(context, composition, layer, images, videos, frame, fps, liveVideoPlayback, activeCamera, exportFrameLocked, exportVideoFrames);
+    drawLayerContent(context, composition, layer, images, videos, frame, fps, liveVideoPlayback, activeCamera, exportFrameLocked, exportVideoFrames, liveTimeRemapFrames);
     return;
   }
 
   contentContext.save();
   contentContext.translate(effectPadding, effectPadding);
-  drawLayerContent(contentContext, composition, layer, images, videos, frame, fps, liveVideoPlayback, activeCamera, exportFrameLocked, exportVideoFrames);
+  drawLayerContent(contentContext, composition, layer, images, videos, frame, fps, liveVideoPlayback, activeCamera, exportFrameLocked, exportVideoFrames, liveTimeRemapFrames);
   contentContext.restore();
 
   if (layer.masks.length > 0) {
@@ -1724,6 +1816,7 @@ function drawLayer(
   activeCamera?: Layer,
   exportFrameLocked = false,
   exportVideoFrames?: ExportVideoFrames,
+  liveTimeRemapFrames?: Map<string, WrappedCanvas | null>,
 ) {
   const fps = finiteNumber(composition.fps, 30);
   const motionAmount = composition.motionBlur && layer.motionBlur ? transformMotionAmount(composition, layer, frame) : 0;
@@ -1737,7 +1830,7 @@ function drawLayer(
     context.save();
     context.globalAlpha = (opacity / 100) * alphaScale;
     applyLayerTransform(context, composition, layer, sampleFrame);
-    drawMaskedLayerContent(context, composition, layer, contentFrame, images, videos, fps, liveVideoPlayback, activeCamera, exportFrameLocked, exportVideoFrames);
+    drawMaskedLayerContent(context, composition, layer, contentFrame, images, videos, fps, liveVideoPlayback, activeCamera, exportFrameLocked, exportVideoFrames, liveTimeRemapFrames);
     context.restore();
   };
 
@@ -1814,6 +1907,11 @@ type RenderCompositionFrameOptions = {
   // Set only by export: this frame's already-decoded picture for every video layer that has
   // a working deterministic decoder, see ExportVideoFrames above.
   exportVideoFrames?: ExportVideoFrames;
+  // Set only by live preview (see CompositionCanvas()): this exact frame's already-decoded
+  // picture, keyed by layer id, for every Time Remapped video layer that has a working
+  // LiveTimeRemapDecoder - see that type's comment for why Time Remap playback needs this
+  // instead of just trusting a live <video> element's seek to have resolved in time.
+  liveTimeRemapFrames?: Map<string, WrappedCanvas | null>;
 };
 
 function renderCompositionFrame(
@@ -1858,13 +1956,13 @@ function renderCompositionFrame(
         applyAdjustmentLayerToCanvas(contentCanvas, composition, layer, frame);
         return;
       }
-      drawLayer(contentContext, composition, layer, frame, options.images, options.videos, false, options.selectedMaskId, options.liveVideoPlayback, activeCamera, options.exportFrameLocked, options.exportVideoFrames);
+      drawLayer(contentContext, composition, layer, frame, options.images, options.videos, false, options.selectedMaskId, options.liveVideoPlayback, activeCamera, options.exportFrameLocked, options.exportVideoFrames, options.liveTimeRemapFrames);
     });
     context.drawImage(contentCanvas, 0, 0, composition.width, composition.height);
   } else {
     drawableLayers
       .filter((layer) => layer.type !== "adjustment")
-      .forEach((layer) => drawLayer(context, composition, layer, frame, options.images, options.videos, false, options.selectedMaskId, options.liveVideoPlayback, activeCamera, options.exportFrameLocked, options.exportVideoFrames));
+      .forEach((layer) => drawLayer(context, composition, layer, frame, options.images, options.videos, false, options.selectedMaskId, options.liveVideoPlayback, activeCamera, options.exportFrameLocked, options.exportVideoFrames, options.liveTimeRemapFrames));
   }
 
   if (options.includeOverlays) {
@@ -2743,6 +2841,12 @@ export function CompositionCanvas() {
   const imageCache = useRef(new Map<string, HTMLImageElement>());
   const videoCache = useRef(new Map<string, HTMLVideoElement>());
   const audioCache = useRef(new Map<string, HTMLAudioElement>());
+  // See LiveTimeRemapDecoder above: one persistent mediabunny/WebCodecs decoder per
+  // time-remapped video layer, keyed by layer id, reconciled by the effect below and consumed
+  // by the canvas-drawing effect further down.
+  const liveTimeRemapDecoders = useRef(new Map<string, LiveTimeRemapDecoder>());
+  const liveTimeRemapGeneration = useRef(0);
+  const [liveTimeRemapVersion, setLiveTimeRemapVersion] = useState(0);
   const exportInProgressRef = useRef(false);
   const dragRef = useRef<DragState | null>(null);
   const [maskDraft, setMaskDraft] = useState<MaskDraft | null>(null);
@@ -2774,6 +2878,91 @@ export function CompositionCanvas() {
     () => project.compositions.find((item) => item.id === activeCompositionId),
     [activeCompositionId, project.compositions],
   );
+
+  // Opens/closes LiveTimeRemapDecoders to match exactly the set of video layers that currently
+  // have Time Remapping on, mirroring buildExportVideoDecoders's own open logic. Runs whenever
+  // the composition object changes (a new layer, a layer's timeRemap/videoUrl toggling, a
+  // different active composition) - cheap to over-run since it no-ops for any layer whose
+  // decoder is already open with a matching videoUrl.
+  useEffect(() => {
+    const decoders = liveTimeRemapDecoders.current;
+    if (!composition) {
+      decoders.forEach((decoder) => {
+        decoder.disposed = true;
+        decoder.input.dispose();
+      });
+      decoders.clear();
+      return;
+    }
+
+    liveTimeRemapGeneration.current += 1;
+    const generation = liveTimeRemapGeneration.current;
+
+    const neededLayers = new Map<string, string>();
+    composition.layers.forEach((layer) => {
+      if (layer.type === "video" && layer.source?.videoUrl && layer.source.timeRemap) {
+        neededLayers.set(layer.id, layer.source.videoUrl);
+      }
+    });
+
+    decoders.forEach((decoder, layerId) => {
+      const neededUrl = neededLayers.get(layerId);
+      if (neededUrl === undefined || neededUrl !== decoder.videoUrl) {
+        decoder.disposed = true;
+        decoder.input.dispose();
+        decoders.delete(layerId);
+      }
+    });
+
+    neededLayers.forEach((videoUrl, layerId) => {
+      if (decoders.has(layerId)) return;
+      (async () => {
+        try {
+          const input = new Input({ source: new UrlSource(videoUrl), formats: ALL_FORMATS });
+          const track = await input.getPrimaryVideoTrack();
+          if (!track) {
+            input.dispose();
+            return;
+          }
+          // Same stricter-than-<video>-playback decodability check export already relies on
+          // (see buildExportVideoDecoders) - an unusual/unsupported codec just means this one
+          // layer keeps using the old live-element seek path instead of failing anything.
+          const decodable = await track.canDecode();
+          if (!decodable || liveTimeRemapGeneration.current !== generation || decoders.has(layerId)) {
+            input.dispose();
+            return;
+          }
+          const sink = new CanvasSink(track);
+          decoders.set(layerId, {
+            input,
+            sink,
+            videoUrl,
+            cache: new Map(),
+            cacheOrder: [],
+            pendingFrame: null,
+            desiredFrame: null,
+            desiredTargetTime: null,
+            disposed: false,
+          });
+          setLiveTimeRemapVersion((version) => version + 1);
+        } catch (error) {
+          console.error(`Live time-remap decoder failed to initialize for video layer "${layerId}":`, error);
+        }
+      })();
+    });
+  }, [composition]);
+
+  // Final cleanup only - disposes every open decoder when the canvas itself unmounts (the
+  // effect above already handles disposing individual decoders as layers/compositions change).
+  useEffect(() => {
+    return () => {
+      liveTimeRemapDecoders.current.forEach((decoder) => {
+        decoder.disposed = true;
+        decoder.input.dispose();
+      });
+      liveTimeRemapDecoders.current.clear();
+    };
+  }, []);
 
   useEffect(() => {
     const onExportVideo = (event: Event) => {
@@ -3125,6 +3314,28 @@ export function CompositionCanvas() {
     context.fillStyle = "#090c10";
     context.fillRect(0, 0, canvas.width, canvas.height);
 
+    // Every Time Remapped layer with an open decoder gets its exact-frame lookup done here,
+    // once per render pass, so drawLayerContent only ever needs a synchronous map read (see
+    // liveTimeRemapFrames on RenderCompositionFrameOptions). A cache miss kicks off the async
+    // decode in the background (requestLiveTimeRemapFrame) without blocking this draw - this
+    // tick falls back to the live <video> element via the existing path, and the resolved
+    // frame bumps liveTimeRemapVersion, which is in this effect's own dependency list below,
+    // so the very next render pass (whether or not playheadFrame has also changed) picks it up.
+    const liveTimeRemapFrames = new Map<string, WrappedCanvas | null>();
+    const compositionFps = finiteNumber(composition.fps, 30);
+    liveTimeRemapDecoders.current.forEach((decoder, layerId) => {
+      const layer = composition.layers.find((candidate) => candidate.id === layerId);
+      if (!layer) return;
+      const liveVideo = videoCache.current.get(decoder.videoUrl);
+      const sourceDuration = liveVideo && Number.isFinite(liveVideo.duration) && liveVideo.duration > 0 ? liveVideo.duration : 0;
+      const targetTime = mediaTimeForFrame(layer, playheadFrame, compositionFps, sourceDuration);
+      const cached = decoder.cache.get(playheadFrame);
+      if (cached !== undefined) liveTimeRemapFrames.set(layerId, cached);
+      if (decoder.desiredFrame !== playheadFrame) {
+        requestLiveTimeRemapFrame(decoder, playheadFrame, targetTime, () => setLiveTimeRemapVersion((version) => version + 1));
+      }
+    });
+
     const current = placement(canvas, composition, canvasZoom, canvasPan);
     context.save();
     context.translate(current.x, current.y);
@@ -3141,9 +3352,10 @@ export function CompositionCanvas() {
       showTransparencyGrid: true,
       includeOverlays: true,
       liveVideoPlayback: isPlaying,
+      liveTimeRemapFrames,
     });
     context.restore();
-  }, [canvasPan, canvasVersion, canvasZoom, composition, isPlaying, maskDraft, mediaVersion, playheadFrame, selectedLayerIds, selectedMaskId, showGrid, showGuides]);
+  }, [canvasPan, canvasVersion, canvasZoom, composition, isPlaying, liveTimeRemapVersion, maskDraft, mediaVersion, playheadFrame, selectedLayerIds, selectedMaskId, showGrid, showGuides]);
 
   if (!composition) return null;
 
